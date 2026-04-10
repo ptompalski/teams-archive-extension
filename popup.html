@@ -18,7 +18,11 @@
 
     <div class="actions">
       <button id="archive-chat-button" type="button">Archive Current Chat</button>
-      <button id="archive-visible-button" type="button">Archive Visible Chats</button>
+      <button id="archive-visible-button" type="button">Archive All Chats</button>
+    </div>
+    <div id="run-indicator" class="run-indicator is-idle" aria-live="polite">
+      <span class="run-dot" aria-hidden="true"></span>
+      <span id="run-label">Idle</span>
     </div>
     <p id="status" class="status" aria-live="polite"></p>
   </main>

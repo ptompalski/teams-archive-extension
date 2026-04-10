@@ -2,15 +2,36 @@ const archiveButton = document.getElementById("archive-chat-button");
 const archiveVisibleButton = document.getElementById("archive-visible-button");
 const statusElement = document.getElementById("status");
 const includeImagesCheckbox = document.getElementById("include-images");
+const runIndicatorElement = document.getElementById("run-indicator");
+const runLabelElement = document.getElementById("run-label");
 let progressListenerRegistered = false;
 
 initializePopup().catch((error) => {
   setStatus(error.message || "Could not load settings.", true);
+  setRunState("error");
 });
 
 function setStatus(message, isError = false) {
   statusElement.textContent = message;
   statusElement.style.color = isError ? "#b42318" : "#344054";
+}
+
+function setRunState(state) {
+  runIndicatorElement.classList.remove("is-idle", "is-running", "is-finished", "is-error");
+
+  const nextState =
+    state === "running" || state === "finished" || state === "error" ? state : "idle";
+
+  runIndicatorElement.classList.add(`is-${nextState}`);
+
+  const labels = {
+    idle: "Idle",
+    running: "Running",
+    finished: "Finished",
+    error: "Stopped with error"
+  };
+
+  runLabelElement.textContent = labels[nextState];
 }
 
 async function initializePopup() {
@@ -91,6 +112,7 @@ function ensureProgressListener() {
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "ARCHIVE_PROGRESS" && message.status) {
+      setRunState("running");
       setStatus(message.status);
     }
   });
@@ -113,6 +135,7 @@ archiveVisibleButton.addEventListener("click", async () => {
 async function runArchiveFlow({ mode }) {
   setBusy(true);
   ensureProgressListener();
+  setRunState("running");
   setStatus("Choose an archive folder...");
 
   try {
@@ -130,14 +153,17 @@ async function runArchiveFlow({ mode }) {
       setStatus("Collecting messages from the current Teams chat...");
       await archiveCurrentChatToFolder(activeTab.id, rootDirectory, settings);
       await rebuildArchiveRootIndex(rootDirectory);
+      setRunState("finished");
       setStatus("Saved snapshot and rebuilt archive for the current chat.");
       return;
     }
 
     await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings);
     await rebuildArchiveRootIndex(rootDirectory);
+    setRunState("finished");
   } catch (error) {
     const wasCancelled = error?.name === "AbortError";
+    setRunState(wasCancelled ? "idle" : "error");
     setStatus(
       wasCancelled
         ? "Archive cancelled."
@@ -169,7 +195,7 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
   const chats = listResponse.payload || [];
 
   if (!chats.length) {
-    throw new Error("No visible chats were found in the current Teams view.");
+    throw new Error("No chats were found in the current Teams view.");
   }
 
   let archivedCount = 0;
@@ -209,11 +235,11 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
   }
 
   if (skippedCount > 0) {
-    setStatus(`Archived ${archivedCount} visible chats and skipped ${skippedCount}.`);
+    setStatus(`Archived ${archivedCount} chats and skipped ${skippedCount}.`);
     return;
   }
 
-  setStatus(`Archived ${archivedCount} visible chats.`);
+  setStatus(`Archived ${archivedCount} chats.`);
 }
 
 async function archiveCurrentChatToFolder(tabId, rootDirectory, settings, chatLabelOverride = "") {

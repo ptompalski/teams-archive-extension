@@ -1,0 +1,11 @@
+# generated archives
+archives/
+*.zip
+
+# local editor/system files
+.DS_Store
+Thumbs.db
+
+# extension test artifacts or saved page dumps
+*.html
+*.png
