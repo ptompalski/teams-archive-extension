@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teams Chat Archiver</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <h1>Teams Chat Archiver</h1>
+    <p class="hint">Archive the current Teams web chat into snapshots plus readable HTML pages.</p>
+
+    <label class="toggle-field" for="include-images">
+      <span class="field-label">Include pasted images</span>
+      <input id="include-images" type="checkbox" checked>
+    </label>
+
+    <div class="actions">
+      <button id="archive-chat-button" type="button">Archive Current Chat</button>
+      <button id="archive-visible-button" type="button">Archive Visible Chats</button>
+    </div>
+    <p id="status" class="status" aria-live="polite"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

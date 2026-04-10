@@ -1,0 +1,1030 @@
+const archiveButton = document.getElementById("archive-chat-button");
+const archiveVisibleButton = document.getElementById("archive-visible-button");
+const statusElement = document.getElementById("status");
+const includeImagesCheckbox = document.getElementById("include-images");
+let progressListenerRegistered = false;
+
+initializePopup().catch((error) => {
+  setStatus(error.message || "Could not load settings.", true);
+});
+
+function setStatus(message, isError = false) {
+  statusElement.textContent = message;
+  statusElement.style.color = isError ? "#b42318" : "#344054";
+}
+
+async function initializePopup() {
+  const settings = await loadSettings();
+  includeImagesCheckbox.checked = settings.includeImages;
+
+  includeImagesCheckbox.addEventListener("change", async () => {
+    await saveSettings(getSettingsFromForm());
+  });
+}
+
+function getSettingsFromForm() {
+  return {
+    includeImages: includeImagesCheckbox.checked
+  };
+}
+
+async function loadSettings() {
+  const defaults = {
+    includeImages: true
+  };
+
+  if (!chrome.storage?.local) {
+    return defaults;
+  }
+
+  const stored = await chrome.storage.local.get(defaults);
+
+  return {
+    includeImages: stored.includeImages ?? defaults.includeImages
+  };
+}
+
+async function saveSettings(settings) {
+  if (!chrome.storage?.local) {
+    return;
+  }
+
+  await chrome.storage.local.set(settings);
+}
+
+async function getActiveTeamsTab() {
+  const tabs = await chrome.tabs.query({
+    active: true,
+    currentWindow: true
+  });
+
+  const activeTab = tabs[0];
+
+  if (!activeTab || !activeTab.id || !activeTab.url) {
+    throw new Error("No active browser tab found.");
+  }
+
+  if (!activeTab.url.startsWith("https://teams.microsoft.com/")) {
+    throw new Error("Open Microsoft Teams on the web, then try again.");
+  }
+
+  return activeTab;
+}
+
+async function ensureContentScriptLoaded(tabId) {
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "PING_TEAMS_ARCHIVER"
+    });
+  } catch (error) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content.js"]
+    });
+  }
+}
+
+function ensureProgressListener() {
+  if (progressListenerRegistered) {
+    return;
+  }
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === "ARCHIVE_PROGRESS" && message.status) {
+      setStatus(message.status);
+    }
+  });
+
+  progressListenerRegistered = true;
+}
+
+archiveButton.addEventListener("click", async () => {
+  await runArchiveFlow({
+    mode: "current"
+  });
+});
+
+archiveVisibleButton.addEventListener("click", async () => {
+  await runArchiveFlow({
+    mode: "visible"
+  });
+});
+
+async function runArchiveFlow({ mode }) {
+  setBusy(true);
+  ensureProgressListener();
+  setStatus("Choose an archive folder...");
+
+  try {
+    const settings = getSettingsFromForm();
+    await saveSettings(settings);
+
+    const rootDirectory = await window.showDirectoryPicker({
+      mode: "readwrite"
+    });
+
+    const activeTab = await getActiveTeamsTab();
+    await ensureContentScriptLoaded(activeTab.id);
+
+    if (mode === "current") {
+      setStatus("Collecting messages from the current Teams chat...");
+      await archiveCurrentChatToFolder(activeTab.id, rootDirectory, settings);
+      await rebuildArchiveRootIndex(rootDirectory);
+      setStatus("Saved snapshot and rebuilt archive for the current chat.");
+      return;
+    }
+
+    await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings);
+    await rebuildArchiveRootIndex(rootDirectory);
+  } catch (error) {
+    const wasCancelled = error?.name === "AbortError";
+    setStatus(
+      wasCancelled
+        ? "Archive cancelled."
+        : error.message || "Unexpected error while archiving chats.",
+      !wasCancelled
+    );
+  } finally {
+    setBusy(false);
+  }
+}
+
+function setBusy(isBusy) {
+  archiveButton.disabled = isBusy;
+  archiveVisibleButton.disabled = isBusy;
+  includeImagesCheckbox.disabled = isBusy;
+}
+
+async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
+  setStatus("Reading visible Teams chats...");
+
+  const listResponse = await chrome.tabs.sendMessage(tabId, {
+    type: "LIST_VISIBLE_CHATS"
+  });
+
+  if (!listResponse || !listResponse.ok) {
+    throw new Error(listResponse?.error || "Could not read the visible Teams chat list.");
+  }
+
+  const chats = listResponse.payload || [];
+
+  if (!chats.length) {
+    throw new Error("No visible chats were found in the current Teams view.");
+  }
+
+  let archivedCount = 0;
+  let skippedCount = 0;
+
+  for (let index = 0; index < chats.length; index += 1) {
+    const chat = chats[index];
+    setStatus(`Opening chat ${index + 1} of ${chats.length}: ${chat.label}`);
+
+    const openResponse = await chrome.tabs.sendMessage(tabId, {
+      type: "OPEN_CHAT_BY_LABEL",
+      chatLabel: chat.label
+    });
+
+    if (!openResponse || !openResponse.ok) {
+      setStatus(`Skipped "${chat.label}": ${openResponse?.error || "could not open chat"}`, true);
+      await wait(1200);
+      continue;
+    }
+
+    setStatus(`Archiving chat ${index + 1} of ${chats.length}: ${chat.label}`);
+    try {
+    await archiveCurrentChatToFolder(tabId, rootDirectory, settings, chat.label);
+    archivedCount += 1;
+    } catch (error) {
+      if (shouldSkipChatError(error)) {
+        skippedCount += 1;
+        setStatus(`Skipped "${chat.label}": ${error.message}`, true);
+        await wait(1200);
+        continue;
+      }
+
+      throw error;
+    }
+
+    await wait(900);
+  }
+
+  if (skippedCount > 0) {
+    setStatus(`Archived ${archivedCount} visible chats and skipped ${skippedCount}.`);
+    return;
+  }
+
+  setStatus(`Archived ${archivedCount} visible chats.`);
+}
+
+async function archiveCurrentChatToFolder(tabId, rootDirectory, settings, chatLabelOverride = "") {
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: "ARCHIVE_CURRENT_CHAT",
+    chatLabelOverride
+  });
+
+  if (!response || !response.ok) {
+    throw new Error(response?.error || "The Teams page did not return any data.");
+  }
+
+  const snapshot = response.payload;
+  const mergedArchive = await rebuildMergedArchive(snapshot);
+  const buildResponse = await chrome.runtime.sendMessage({
+    type: "BUILD_ARCHIVE_FILES",
+    snapshot,
+    mergedArchive,
+    settings
+  });
+
+  if (!buildResponse || !buildResponse.ok) {
+    throw new Error(buildResponse?.error || "Could not prepare archive files.");
+  }
+
+    await writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedArchive, settings);
+}
+
+function shouldSkipChatError(error) {
+  const message = String(error?.message || "");
+
+  return (
+    message.includes("No messages were found") ||
+    message.includes("The Teams page did not return any data")
+  );
+}
+
+async function rebuildMergedArchive(snapshot) {
+  const mergedMessages = dedupeAndSortMessages(snapshot.messages || []);
+
+  return {
+    exportedAt: snapshot.exportedAt,
+    pageTitle: snapshot.pageTitle,
+    pageUrl: snapshot.pageUrl,
+    chatTitle: snapshot.chatTitle,
+    chatOrder: Number.isFinite(Number(snapshot.chatOrder)) ? Number(snapshot.chatOrder) : -1,
+    messageCount: mergedMessages.length,
+    messages: mergedMessages
+  };
+}
+
+async function writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedArchive, settings) {
+  const chatDirectory = await getOrCreateDirectory(rootDirectory, buildResponse.folderName);
+  const snapshotsDirectory = await getOrCreateDirectory(chatDirectory, "snapshots");
+
+  await writeTextFile(
+    snapshotsDirectory,
+    buildResponse.snapshotFilename,
+    JSON.stringify(snapshot, null, 2)
+  );
+
+  const mergedFromSnapshots = await rebuildFromSnapshots(snapshotsDirectory, mergedArchive);
+  const rebuiltResponse = await chrome.runtime.sendMessage({
+    type: "BUILD_ARCHIVE_FILES",
+    snapshot,
+    mergedArchive: mergedFromSnapshots,
+    settings
+  });
+
+  if (!rebuiltResponse || !rebuiltResponse.ok) {
+    throw new Error(rebuiltResponse?.error || "Could not rebuild latest archive.");
+  }
+
+  const archiveWithImages = settings.includeImages
+    ? await materializeInlineImages(chatDirectory, mergedFromSnapshots)
+    : await stripInlineImages(chatDirectory, mergedFromSnapshots);
+  const finalBuildResponse = await chrome.runtime.sendMessage({
+    type: "BUILD_ARCHIVE_FILES",
+    snapshot,
+    mergedArchive: archiveWithImages,
+    settings
+  });
+
+  if (!finalBuildResponse || !finalBuildResponse.ok) {
+    throw new Error(finalBuildResponse?.error || "Could not build archive files with images.");
+  }
+
+  await writeTextFile(chatDirectory, "latest.json", finalBuildResponse.latestJsonText);
+  await writeTextFile(chatDirectory, "manifest.json", finalBuildResponse.manifestText);
+
+  await writeTextFile(chatDirectory, "latest.html", finalBuildResponse.latestHtmlText);
+  await syncYearlyHtmlFiles(chatDirectory, finalBuildResponse.yearlyHtmlFiles || []);
+  await deleteDirectoryContentsIfExists(chatDirectory, "md");
+}
+
+async function rebuildArchiveRootIndex(rootDirectory) {
+  const entries = [];
+
+  for await (const entry of rootDirectory.values()) {
+    if (entry.kind !== "directory") {
+      continue;
+    }
+
+    const manifest = await readJsonFileIfExists(entry, "manifest.json");
+
+    if (!manifest) {
+      continue;
+    }
+
+    entries.push({
+      folderName: entry.name,
+      chatTitle: String(manifest.chatTitle || manifest.archiveLabel || entry.name),
+      archiveLabel: String(manifest.archiveLabel || manifest.chatTitle || entry.name),
+      chatOrder: Number.isFinite(Number(manifest.chatOrder)) ? Number(manifest.chatOrder) : -1,
+      lastArchivedAt: String(manifest.lastArchivedAt || ""),
+      latestMessageCount: Number(manifest.latestMessageCount || 0),
+      firstMessageAt: String(manifest.firstMessageAt || ""),
+      lastMessageAt: String(manifest.lastMessageAt || ""),
+      newestSnapshot: String(manifest.newestSnapshot || ""),
+      readableFormat: "html"
+    });
+  }
+
+  entries.sort((left, right) => {
+    const leftOrder = Number.isFinite(left.chatOrder) ? left.chatOrder : -1;
+    const rightOrder = Number.isFinite(right.chatOrder) ? right.chatOrder : -1;
+    const leftHasOrder = leftOrder >= 0;
+    const rightHasOrder = rightOrder >= 0;
+
+    if (leftHasOrder && rightHasOrder && leftOrder !== rightOrder) {
+      return leftOrder - rightOrder;
+    }
+
+    if (leftHasOrder !== rightHasOrder) {
+      return leftHasOrder ? -1 : 1;
+    }
+
+    const leftTime = Date.parse(left.lastArchivedAt || "") || 0;
+    const rightTime = Date.parse(right.lastArchivedAt || "") || 0;
+
+    if (leftTime !== rightTime) {
+      return rightTime - leftTime;
+    }
+
+    return left.chatTitle.localeCompare(right.chatTitle);
+  });
+
+  await writeTextFile(rootDirectory, "index.html", buildArchiveRootIndexHtml(entries));
+}
+
+async function readJsonFileIfExists(directoryHandle, filename) {
+  try {
+    const fileHandle = await directoryHandle.getFileHandle(filename);
+    const file = await fileHandle.getFile();
+    return JSON.parse(await file.text());
+  } catch (error) {
+    return null;
+  }
+}
+
+function buildArchiveRootIndexHtml(entries) {
+  const rowsHtml = entries
+    .map((entry) => {
+      const latestLink = `${encodePathPart(entry.folderName)}/latest.html`;
+      return `
+        <article class="chat-card">
+          <h2><a href="${latestLink}">${escapeHtml(entry.chatTitle)}</a></h2>
+          <p class="archive-label">${escapeHtml(entry.archiveLabel)}</p>
+          <p class="meta">Last archived: ${escapeHtml(formatDisplayDate(entry.lastArchivedAt))}</p>
+          <p class="meta">Messages: ${escapeHtml(String(entry.latestMessageCount))}</p>
+          <p class="meta">Chat range: ${escapeHtml(formatRange(entry.firstMessageAt, entry.lastMessageAt))}</p>
+          <div class="links">
+            <a href="${latestLink}">Open HTML</a>
+          </div>
+        </article>
+      `;
+    })
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teams Archive Index</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef4f9;
+      --panel: #ffffff;
+      --panel-border: #d7e2ec;
+      --text: #172026;
+      --muted: #52606d;
+      --accent: #005a9c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: linear-gradient(180deg, var(--bg) 0%, #f8fbfd 100%);
+      color: var(--text);
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 32px;
+      line-height: 1.1;
+    }
+    .intro {
+      margin: 0 0 24px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+    .chat-card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 10px 30px rgba(9, 30, 66, 0.06);
+    }
+    .chat-card h2 {
+      margin: 0 0 6px;
+      font-size: 18px;
+      line-height: 1.3;
+    }
+    .chat-card a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .chat-card a:hover {
+      text-decoration: underline;
+    }
+    .archive-label {
+      margin: 0 0 10px;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .meta {
+      margin: 4px 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .links {
+      display: flex;
+      gap: 14px;
+      margin-top: 14px;
+      flex-wrap: wrap;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Teams Archive</h1>
+    <p class="intro">Browse archived chats and open each chat overview page.</p>
+    <section class="grid">
+      ${rowsHtml}
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+async function syncYearlyHtmlFiles(chatDirectory, yearlyHtmlFiles) {
+  const htmlDirectory = await getOrCreateDirectory(chatDirectory, "html");
+  const wanted = new Set(yearlyHtmlFiles.map((file) => file.filename));
+
+  for (const file of yearlyHtmlFiles) {
+    await writeTextFile(htmlDirectory, file.filename, file.content);
+  }
+
+  for await (const entry of htmlDirectory.values()) {
+    if (entry.kind !== "file") {
+      continue;
+    }
+
+    if (!wanted.has(entry.name)) {
+      await htmlDirectory.removeEntry(entry.name);
+    }
+  }
+}
+
+async function rebuildFromSnapshots(snapshotsDirectory, fallbackArchive) {
+  const snapshots = [];
+
+  for await (const entry of snapshotsDirectory.values()) {
+    if (entry.kind !== "file" || !entry.name.endsWith(".json")) {
+      continue;
+    }
+
+    const file = await entry.getFile();
+    const text = await file.text();
+
+    try {
+      snapshots.push(JSON.parse(text));
+    } catch (error) {
+      // Ignore malformed snapshot files so the archive remains usable.
+    }
+  }
+
+  if (!snapshots.length) {
+    return fallbackArchive;
+  }
+
+  snapshots.sort((left, right) => {
+    const leftTime = Date.parse(left.exportedAt || "") || 0;
+    const rightTime = Date.parse(right.exportedAt || "") || 0;
+    return leftTime - rightTime;
+  });
+
+  const mergedMessages = dedupeAndSortMessages(
+    snapshots.flatMap((snapshot) => snapshot.messages || [])
+  );
+  const lastSnapshot = snapshots[snapshots.length - 1];
+
+  return {
+    exportedAt: lastSnapshot.exportedAt || fallbackArchive.exportedAt,
+    pageTitle: lastSnapshot.pageTitle || fallbackArchive.pageTitle,
+    pageUrl: lastSnapshot.pageUrl || fallbackArchive.pageUrl,
+    chatTitle: lastSnapshot.chatTitle || fallbackArchive.chatTitle,
+    chatOrder:
+      Number.isFinite(Number(lastSnapshot.chatOrder)) && Number(lastSnapshot.chatOrder) >= 0
+        ? Number(lastSnapshot.chatOrder)
+        : Number.isFinite(Number(fallbackArchive.chatOrder))
+          ? Number(fallbackArchive.chatOrder)
+          : -1,
+    messageCount: mergedMessages.length,
+    messages: mergedMessages
+  };
+}
+
+function dedupeAndSortMessages(messages) {
+  const seen = new Set();
+  const deduped = [];
+
+  for (const message of messages) {
+    const normalized = normalizeMessage(message);
+    const key = buildMessageKey(normalized);
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(normalized);
+  }
+
+  return deduped.sort(compareMessages);
+}
+
+function normalizeMessage(message) {
+  return {
+    id: String(message?.id || "").trim(),
+    author: String(message?.author || "").trim() || "Unknown",
+    timestamp: String(message?.timestamp || "").trim(),
+    text: String(message?.text || "").replace(/\r/g, "").trim(),
+    images: normalizeImages(message?.images)
+  };
+}
+
+function normalizeImages(images) {
+  if (!Array.isArray(images)) {
+    return [];
+  }
+
+  const seen = new Set();
+  const normalized = [];
+
+  for (const image of images) {
+    const sourceUrl = String(image?.sourceUrl || "").trim();
+    const localPath = String(image?.localPath || "").trim();
+    const alt = String(image?.alt || "").trim();
+    const embeddedDataUrl = String(image?.embeddedDataUrl || "").trim();
+    const key = localPath || sourceUrl;
+
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    normalized.push({
+      sourceUrl,
+      localPath,
+      alt,
+      embeddedDataUrl
+    });
+  }
+
+  return normalized;
+}
+
+function buildMessageKey(message) {
+  if (message.id) {
+    return `id:${message.id}`;
+  }
+
+  return [
+    message.author,
+    normalizeTimestampKey(message.timestamp),
+    message.text
+  ].join("|");
+}
+
+function compareMessages(left, right) {
+  const leftTime = parseTimestampValue(left.timestamp);
+  const rightTime = parseTimestampValue(right.timestamp);
+
+  if (leftTime && rightTime) {
+    const diff = leftTime.getTime() - rightTime.getTime();
+
+    if (diff !== 0) {
+      return diff;
+    }
+  }
+
+  if (left.author !== right.author) {
+    return left.author.localeCompare(right.author);
+  }
+
+  return left.text.localeCompare(right.text);
+}
+
+function normalizeTimestampKey(value) {
+  const parsed = parseTimestampValue(value);
+  return parsed ? parsed.toISOString() : String(value || "").trim();
+}
+
+function parseTimestampValue(value) {
+  if (!value || typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim();
+
+  if (!normalized) {
+    return null;
+  }
+
+  const direct = new Date(normalized);
+
+  if (!Number.isNaN(direct.getTime())) {
+    return direct;
+  }
+
+  const todayMatch = normalized.match(/^today\s+at\s+(.+)$/i);
+  if (todayMatch) {
+    return parseRelativeTime(todayMatch[1], 0);
+  }
+
+  const yesterdayMatch = normalized.match(/^yesterday\s+at\s+(.+)$/i);
+  if (yesterdayMatch) {
+    return parseRelativeTime(yesterdayMatch[1], -1);
+  }
+
+  return null;
+}
+
+function parseRelativeTime(timeText, dayOffset) {
+  const timeMatch = timeText.trim().match(/^(\d{1,2}):(\d{2})(?:\s*(AM|PM))?$/i);
+
+  if (!timeMatch) {
+    return null;
+  }
+
+  let hours = Number(timeMatch[1]);
+  const minutes = Number(timeMatch[2]);
+  const meridiem = (timeMatch[3] || "").toUpperCase();
+
+  if (meridiem === "PM" && hours < 12) {
+    hours += 12;
+  }
+
+  if (meridiem === "AM" && hours === 12) {
+    hours = 0;
+  }
+
+  const date = new Date();
+  date.setDate(date.getDate() + dayOffset);
+  date.setHours(hours, minutes, 0, 0);
+  return date;
+}
+
+async function getOrCreateDirectory(parentHandle, name) {
+  return parentHandle.getDirectoryHandle(name, { create: true });
+}
+
+async function writeTextFile(directoryHandle, filename, contents) {
+  const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(contents);
+  await writable.close();
+}
+
+async function materializeInlineImages(chatDirectory, archive) {
+  const imagesDirectory = await getOrCreateDirectory(chatDirectory, "assets");
+  const nestedImagesDirectory = await getOrCreateDirectory(imagesDirectory, "images");
+  const wantedPaths = new Set();
+  const updatedMessages = [];
+
+  for (let messageIndex = 0; messageIndex < (archive.messages || []).length; messageIndex += 1) {
+    const message = archive.messages[messageIndex];
+    const updatedImages = [];
+
+    for (let imageIndex = 0; imageIndex < (message.images || []).length; imageIndex += 1) {
+      const image = message.images[imageIndex];
+      const savedImage = await saveInlineImage(
+        nestedImagesDirectory,
+        message,
+        image,
+        imageIndex
+      );
+
+      if (!savedImage) {
+        continue;
+      }
+
+      wantedPaths.add(savedImage.localPath);
+      updatedImages.push(savedImage);
+    }
+
+    updatedMessages.push({
+      ...message,
+      images: updatedImages
+    });
+  }
+
+  await pruneUnusedImageAssets(nestedImagesDirectory, wantedPaths);
+
+  return {
+    ...archive,
+    messages: updatedMessages,
+    messageCount: updatedMessages.length
+  };
+}
+
+async function stripInlineImages(chatDirectory, archive) {
+  const imagesDirectory = await getOrCreateDirectory(chatDirectory, "assets");
+  const nestedImagesDirectory = await getOrCreateDirectory(imagesDirectory, "images");
+  await pruneUnusedImageAssets(nestedImagesDirectory, new Set());
+
+  return {
+    ...archive,
+    messages: (archive.messages || []).map((message) => ({
+      ...message,
+      images: []
+    })),
+    messageCount: (archive.messages || []).length
+  };
+}
+
+async function saveInlineImage(imagesDirectory, message, image, imageIndex) {
+  const sourceUrl = String(image?.sourceUrl || "").trim();
+  const embeddedDataUrl = String(image?.embeddedDataUrl || "").trim();
+
+  if (!sourceUrl && !embeddedDataUrl) {
+    return null;
+  }
+
+  try {
+    const fetched = await fetchImageBlob(sourceUrl, embeddedDataUrl);
+
+    if (!fetched) {
+      return image.localPath ? image : null;
+    }
+
+    const bucketName = buildImageBucketName(message.timestamp);
+    const bucketDirectory = await getOrCreateDirectory(imagesDirectory, bucketName);
+    const extension = chooseImageExtension(sourceUrl, fetched.blob.type);
+    const contentHash = await computeBlobHash(fetched.blob);
+    const filename = `${contentHash}.${extension}`;
+    const localPath = `assets/images/${bucketName}/${filename}`;
+
+    await writeBlobFile(bucketDirectory, filename, fetched.blob);
+
+    return {
+      sourceUrl,
+      alt: String(image?.alt || "").trim(),
+      localPath
+    };
+  } catch (error) {
+    return image.localPath ? image : null;
+  }
+}
+
+async function fetchImageBlob(sourceUrl, embeddedDataUrl = "") {
+  if (embeddedDataUrl.startsWith("data:")) {
+    const response = await fetch(embeddedDataUrl);
+    return {
+      blob: await response.blob()
+    };
+  }
+
+  if (sourceUrl.startsWith("data:")) {
+    const response = await fetch(sourceUrl);
+    return {
+      blob: await response.blob()
+    };
+  }
+
+  if (!/^https?:/i.test(sourceUrl)) {
+    return null;
+  }
+
+  const response = await fetch(sourceUrl, {
+    credentials: "include"
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  return {
+    blob: await response.blob()
+  };
+}
+
+function buildImageBucketName(timestamp) {
+  const parsed = parseTimestampValue(timestamp);
+
+  if (!parsed) {
+    return "unknown";
+  }
+
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+}
+
+function chooseImageExtension(sourceUrl, mimeType) {
+  const mimeToExtension = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg"
+  };
+
+  if (mimeType && mimeToExtension[mimeType]) {
+    return mimeToExtension[mimeType];
+  }
+
+  const match = sourceUrl.match(/\.([a-z0-9]+)(?:[?#]|$)/i);
+
+  if (match) {
+    return match[1].toLowerCase();
+  }
+
+  return "png";
+}
+
+async function writeBlobFile(directoryHandle, filename, blob) {
+  const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+}
+
+async function computeBlobHash(blob) {
+  const buffer = await blob.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  const hashBytes = Array.from(new Uint8Array(hashBuffer));
+  return hashBytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function pruneUnusedImageAssets(imagesDirectory, wantedPaths) {
+  const pathByBucket = new Map();
+
+  for (const wantedPath of wantedPaths) {
+    const normalized = wantedPath.replace(/\\/g, "/");
+    const parts = normalized.split("/");
+
+    if (parts.length < 4) {
+      continue;
+    }
+
+    const bucketName = parts[2];
+    const filename = parts.slice(3).join("/");
+
+    if (!pathByBucket.has(bucketName)) {
+      pathByBucket.set(bucketName, new Set());
+    }
+
+    pathByBucket.get(bucketName).add(filename);
+  }
+
+  for await (const bucketEntry of imagesDirectory.values()) {
+    if (bucketEntry.kind !== "directory") {
+      continue;
+    }
+
+    const wantedFiles = pathByBucket.get(bucketEntry.name) || new Set();
+
+    for await (const entry of bucketEntry.values()) {
+      if (entry.kind !== "file") {
+        continue;
+      }
+
+      if (!wantedFiles.has(entry.name)) {
+        await bucketEntry.removeEntry(entry.name);
+      }
+    }
+  }
+}
+
+function sanitizeFilePart(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[<>:"/\\|?*]+/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase();
+}
+
+async function deleteFileIfExists(directoryHandle, filename) {
+  try {
+    await directoryHandle.removeEntry(filename);
+  } catch (error) {
+    if (error?.name !== "NotFoundError") {
+      throw error;
+    }
+  }
+}
+
+async function deleteDirectoryContentsIfExists(directoryHandle, directoryName) {
+  try {
+    const nestedDirectory = await directoryHandle.getDirectoryHandle(directoryName);
+
+    for await (const entry of nestedDirectory.values()) {
+      await nestedDirectory.removeEntry(entry.name, { recursive: entry.kind === "directory" });
+    }
+  } catch (error) {
+    if (error?.name !== "NotFoundError") {
+      throw error;
+    }
+  }
+}
+
+function wait(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function encodePathPart(value) {
+  return String(value || "")
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+function formatDisplayDate(value) {
+  const parsed = Date.parse(value || "");
+
+  if (Number.isNaN(parsed)) {
+    return value || "Unknown";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(parsed));
+}
+
+function formatRange(firstValue, lastValue) {
+  const first = formatShortDate(firstValue);
+  const last = formatShortDate(lastValue);
+
+  if (!first && !last) {
+    return "Unknown";
+  }
+
+  if (first && last && first !== last) {
+    return `${first} to ${last}`;
+  }
+
+  return first || last;
+}
+
+function formatShortDate(value) {
+  const parsed = Date.parse(value || "");
+
+  if (Number.isNaN(parsed)) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric"
+  }).format(new Date(parsed));
+}
