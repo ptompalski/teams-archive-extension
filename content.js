@@ -948,6 +948,14 @@ function shouldIgnoreInlineImage(imageElement) {
     return true;
   }
 
+  if (
+    /statics\.teams\.cdn\.office\.net\/evergreen-assets\/personal-expressions/i.test(sourceUrl) ||
+    /media\d*\.giphy\.com/i.test(sourceUrl) ||
+    /giphy_s\.gif/i.test(sourceUrl)
+  ) {
+    return true;
+  }
+
   const width = Number(imageElement.getAttribute("width") || 0);
   const height = Number(imageElement.getAttribute("height") || 0);
 

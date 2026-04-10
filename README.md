@@ -48,6 +48,7 @@ YourArchiveFolder/
 - `html/<year>.html` files contain the readable transcript split by year
 - Images are stored as separate files and referenced from the HTML pages
 - Image filenames are based on content hashes so the same pasted image does not need to be saved multiple times
+- The extension validates that key output files were written before showing a finished status
 
 ## Current limitations
 
@@ -74,3 +75,5 @@ YourArchiveFolder/
 10. Click **Archive Current Chat** or **Archive All Chats**.
 11. Choose the root folder where you want the archive stored.
 12. After the tool finishes, which may take a while for larger chats, open that archive folder and open `index.html` to browse the archived chats.
+
+While the tool is running, avoid interacting with the Teams tab. You can switch to another tab or another application, but do not click, scroll, change chats, or navigate away in the Teams tab until the status shows that the archive is finished.

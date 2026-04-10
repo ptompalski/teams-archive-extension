@@ -151,16 +151,23 @@ async function runArchiveFlow({ mode }) {
 
     if (mode === "current") {
       setStatus("Collecting messages from the current Teams chat...");
-      await archiveCurrentChatToFolder(activeTab.id, rootDirectory, settings);
+      const validation = await archiveCurrentChatToFolder(activeTab.id, rootDirectory, settings);
       await rebuildArchiveRootIndex(rootDirectory);
+      await validateRootIndex(rootDirectory);
       setRunState("finished");
-      setStatus("Saved snapshot and rebuilt archive for the current chat.");
+      setStatus(
+        `Finished. Verified ${validation.chatTitle || "chat archive"} and root index files.`
+      );
       return;
     }
 
-    await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings);
+    const batchResult = await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings);
     await rebuildArchiveRootIndex(rootDirectory);
+    await validateRootIndex(rootDirectory);
     setRunState("finished");
+    setStatus(
+      `Finished. Verified ${batchResult.archivedCount} chat archives and the root index.`
+    );
   } catch (error) {
     const wasCancelled = error?.name === "AbortError";
     setRunState(wasCancelled ? "idle" : "error");
@@ -200,6 +207,7 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
 
   let archivedCount = 0;
   let skippedCount = 0;
+  const validatedChats = [];
 
   for (let index = 0; index < chats.length; index += 1) {
     const chat = chats[index];
@@ -218,8 +226,9 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
 
     setStatus(`Archiving chat ${index + 1} of ${chats.length}: ${chat.label}`);
     try {
-    await archiveCurrentChatToFolder(tabId, rootDirectory, settings, chat.label);
-    archivedCount += 1;
+      const validation = await archiveCurrentChatToFolder(tabId, rootDirectory, settings, chat.label);
+      archivedCount += 1;
+      validatedChats.push(validation);
     } catch (error) {
       if (shouldSkipChatError(error)) {
         skippedCount += 1;
@@ -236,10 +245,19 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
 
   if (skippedCount > 0) {
     setStatus(`Archived ${archivedCount} chats and skipped ${skippedCount}.`);
-    return;
+    return {
+      archivedCount,
+      skippedCount,
+      validatedChats
+    };
   }
 
   setStatus(`Archived ${archivedCount} chats.`);
+  return {
+    archivedCount,
+    skippedCount,
+    validatedChats
+  };
 }
 
 async function archiveCurrentChatToFolder(tabId, rootDirectory, settings, chatLabelOverride = "") {
@@ -265,7 +283,7 @@ async function archiveCurrentChatToFolder(tabId, rootDirectory, settings, chatLa
     throw new Error(buildResponse?.error || "Could not prepare archive files.");
   }
 
-    await writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedArchive, settings);
+  return writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedArchive, settings);
 }
 
 function shouldSkipChatError(error) {
@@ -333,6 +351,53 @@ async function writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedA
   await writeTextFile(chatDirectory, "latest.html", finalBuildResponse.latestHtmlText);
   await syncYearlyHtmlFiles(chatDirectory, finalBuildResponse.yearlyHtmlFiles || []);
   await deleteDirectoryContentsIfExists(chatDirectory, "md");
+
+  await validateChatArchiveFiles(
+    chatDirectory,
+    buildResponse.snapshotFilename,
+    finalBuildResponse.yearlyHtmlFiles || []
+  );
+
+  return {
+    folderName: buildResponse.folderName,
+    chatTitle: snapshot.chatTitle || mergedArchive.chatTitle || buildResponse.folderName
+  };
+}
+
+async function validateChatArchiveFiles(chatDirectory, snapshotFilename, yearlyHtmlFiles) {
+  await validateTextFile(chatDirectory, "latest.json");
+  await validateTextFile(chatDirectory, "manifest.json");
+  await validateTextFile(chatDirectory, "latest.html");
+
+  const snapshotsDirectory = await chatDirectory.getDirectoryHandle("snapshots");
+  await validateTextFile(snapshotsDirectory, snapshotFilename);
+
+  if (Array.isArray(yearlyHtmlFiles) && yearlyHtmlFiles.length) {
+    const htmlDirectory = await chatDirectory.getDirectoryHandle("html");
+
+    for (const file of yearlyHtmlFiles) {
+      if (!file?.filename) {
+        continue;
+      }
+
+      await validateTextFile(htmlDirectory, file.filename);
+    }
+  }
+}
+
+async function validateRootIndex(rootDirectory) {
+  await validateTextFile(rootDirectory, "index.html");
+}
+
+async function validateTextFile(directoryHandle, filename) {
+  const fileHandle = await directoryHandle.getFileHandle(filename);
+  const file = await fileHandle.getFile();
+
+  if (!file || file.size <= 0) {
+    throw new Error(`Validation failed: ${filename} was not written correctly.`);
+  }
+
+  return file;
 }
 
 async function rebuildArchiveRootIndex(rootDirectory) {
@@ -853,8 +918,9 @@ async function fetchImageBlob(sourceUrl, embeddedDataUrl = "") {
     return null;
   }
 
+  const useIncludedCredentials = shouldUseCredentialsForImage(sourceUrl);
   const response = await fetch(sourceUrl, {
-    credentials: "include"
+    credentials: useIncludedCredentials ? "include" : "omit"
   });
 
   if (!response.ok) {
@@ -864,6 +930,15 @@ async function fetchImageBlob(sourceUrl, embeddedDataUrl = "") {
   return {
     blob: await response.blob()
   };
+}
+
+function shouldUseCredentialsForImage(sourceUrl) {
+  try {
+    const parsed = new URL(sourceUrl);
+    return /(^|\.)teams\.microsoft\.com$/i.test(parsed.hostname);
+  } catch (error) {
+    return false;
+  }
 }
 
 function buildImageBucketName(timestamp) {
