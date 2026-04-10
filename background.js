@@ -108,6 +108,7 @@ function buildChatOverviewHtml(archive, yearlyHtmlFiles) {
 <body>
   <main>
     <section class="summary">
+      <p class="meta"><a href="../index.html">Back to main index</a></p>
       <h1>${escapeHtml(chatTitle)}</h1>
       <p class="meta">Exported: ${escapeHtml(formatTimestampDisplay(archive.exportedAt || ""))}</p>
       <p class="meta">Exported range: ${escapeHtml(formatDateRange(firstMessageAt, lastMessageAt))}</p>
@@ -180,6 +181,7 @@ function buildYearlyTranscriptHtml(chatTitle, yearKey, groups) {
 <body>
   <main>
     <section class="summary">
+      <p class="meta"><a href="../../index.html">Back to main index</a></p>
       <h1>${escapeHtml(chatTitle)}</h1>
       <p class="meta">Year: ${escapeHtml(yearKey)}</p>
       <p class="meta">Exported range: ${escapeHtml(formatDateRange(firstMessageAt, lastMessageAt))}</p>

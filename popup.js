@@ -153,20 +153,20 @@ async function runArchiveFlow({ mode }) {
       setStatus("Collecting messages from the current Teams chat...");
       const validation = await archiveCurrentChatToFolder(activeTab.id, rootDirectory, settings);
       await rebuildArchiveRootIndex(rootDirectory);
-      await validateRootIndex(rootDirectory);
+      await validateRootFiles(rootDirectory);
       setRunState("finished");
       setStatus(
-        `Finished. Verified ${validation.chatTitle || "chat archive"} and root index files.`
+        `Finished. Verified ${validation.chatTitle || "chat archive"}, index, and search files.`
       );
       return;
     }
 
     const batchResult = await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings);
     await rebuildArchiveRootIndex(rootDirectory);
-    await validateRootIndex(rootDirectory);
+    await validateRootFiles(rootDirectory);
     setRunState("finished");
     setStatus(
-      `Finished. Verified ${batchResult.archivedCount} chat archives and the root index.`
+      `Finished. Verified ${batchResult.archivedCount} chat archives plus the index and search files.`
     );
   } catch (error) {
     const wasCancelled = error?.name === "AbortError";
@@ -385,8 +385,9 @@ async function validateChatArchiveFiles(chatDirectory, snapshotFilename, yearlyH
   }
 }
 
-async function validateRootIndex(rootDirectory) {
+async function validateRootFiles(rootDirectory) {
   await validateTextFile(rootDirectory, "index.html");
+  await validateTextFile(rootDirectory, "search.html");
 }
 
 async function validateTextFile(directoryHandle, filename) {
@@ -402,6 +403,7 @@ async function validateTextFile(directoryHandle, filename) {
 
 async function rebuildArchiveRootIndex(rootDirectory) {
   const entries = [];
+  const searchRecords = [];
 
   for await (const entry of rootDirectory.values()) {
     if (entry.kind !== "directory") {
@@ -426,6 +428,18 @@ async function rebuildArchiveRootIndex(rootDirectory) {
       newestSnapshot: String(manifest.newestSnapshot || ""),
       readableFormat: "html"
     });
+
+    const latestArchive = await readJsonFileIfExists(entry, "latest.json");
+
+    if (latestArchive?.messages?.length) {
+      searchRecords.push(
+        ...buildSearchRecords({
+          folderName: entry.name,
+          chatTitle: String(manifest.chatTitle || manifest.archiveLabel || entry.name),
+          messages: latestArchive.messages
+        })
+      );
+    }
   }
 
   entries.sort((left, right) => {
@@ -453,6 +467,7 @@ async function rebuildArchiveRootIndex(rootDirectory) {
   });
 
   await writeTextFile(rootDirectory, "index.html", buildArchiveRootIndexHtml(entries));
+  await writeTextFile(rootDirectory, "search.html", buildArchiveSearchHtml(searchRecords));
 }
 
 async function readJsonFileIfExists(directoryHandle, filename) {
@@ -470,16 +485,12 @@ function buildArchiveRootIndexHtml(entries) {
     .map((entry) => {
       const latestLink = `${encodePathPart(entry.folderName)}/latest.html`;
       return `
-        <article class="chat-card">
-          <h2><a href="${latestLink}">${escapeHtml(entry.chatTitle)}</a></h2>
-          <p class="archive-label">${escapeHtml(entry.archiveLabel)}</p>
-          <p class="meta">Last archived: ${escapeHtml(formatDisplayDate(entry.lastArchivedAt))}</p>
-          <p class="meta">Messages: ${escapeHtml(String(entry.latestMessageCount))}</p>
-          <p class="meta">Chat range: ${escapeHtml(formatRange(entry.firstMessageAt, entry.lastMessageAt))}</p>
-          <div class="links">
-            <a href="${latestLink}">Open HTML</a>
-          </div>
-        </article>
+        <tr>
+          <td class="chat-name"><a href="${latestLink}">${escapeHtml(entry.chatTitle)}</a></td>
+          <td>${escapeHtml(formatDisplayDate(entry.lastArchivedAt))}</td>
+          <td>${escapeHtml(String(entry.latestMessageCount))}</td>
+          <td>${escapeHtml(formatRange(entry.firstMessageAt, entry.lastMessageAt))}</td>
+        </tr>
       `;
     })
     .join("\n");
@@ -522,60 +533,287 @@ function buildArchiveRootIndexHtml(entries) {
       color: var(--muted);
       font-size: 15px;
     }
-    .grid {
-      display: grid;
-      gap: 16px;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    }
-    .chat-card {
+    .archive-list {
       background: var(--panel);
       border: 1px solid var(--panel-border);
       border-radius: 14px;
-      padding: 18px;
       box-shadow: 0 10px 30px rgba(9, 30, 66, 0.06);
+      overflow: hidden;
     }
-    .chat-card h2 {
-      margin: 0 0 6px;
-      font-size: 18px;
-      line-height: 1.3;
+    table {
+      width: 100%;
+      border-collapse: collapse;
     }
-    .chat-card a {
+    th,
+    td {
+      padding: 14px 16px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--panel-border);
+      font-size: 14px;
+    }
+    th {
+      background: #f6f9fc;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+    td a {
       color: var(--accent);
       text-decoration: none;
     }
-    .chat-card a:hover {
+    td a:hover {
       text-decoration: underline;
     }
-    .archive-label {
-      margin: 0 0 10px;
-      color: var(--text);
-      font-size: 14px;
-      font-weight: 600;
+    .chat-name {
+      font-weight: 700;
+      min-width: 220px;
     }
-    .meta {
-      margin: 4px 0;
+    .empty-state {
+      padding: 20px;
       color: var(--muted);
-      font-size: 13px;
-    }
-    .links {
-      display: flex;
-      gap: 14px;
-      margin-top: 14px;
-      flex-wrap: wrap;
       font-size: 14px;
+    }
+    @media (max-width: 840px) {
+      .archive-list {
+        overflow-x: auto;
+      }
+      table {
+        min-width: 760px;
+      }
     }
   </style>
 </head>
 <body>
   <main>
     <h1>Teams Archive</h1>
-    <p class="intro">Browse archived chats and open each chat overview page.</p>
-    <section class="grid">
-      ${rowsHtml}
+    <p class="intro">Browse archived chats and open each chat overview page. Need message-level search? Open <a href="search.html">archive search</a>.</p>
+    <section class="archive-list">
+      ${
+        rowsHtml
+          ? `<table>
+      <thead>
+        <tr>
+          <th>Chat</th>
+          <th>Last Archived</th>
+          <th>Messages</th>
+          <th>Chat Range</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rowsHtml}
+      </tbody>
+    </table>`
+          : `<div class="empty-state">No archived chats found yet.</div>`
+      }
     </section>
   </main>
 </body>
 </html>`;
+}
+
+function buildSearchRecords({ folderName, chatTitle, messages }) {
+  return (messages || [])
+    .filter((message) => (message?.text || "").trim())
+    .map((message) => {
+      const timestamp = String(message.timestamp || "");
+      const yearLink = buildMessageYearlyLink(folderName, timestamp);
+
+      return {
+        chatTitle,
+        author: String(message.author || "Unknown"),
+        timestamp,
+        text: String(message.text || "").replace(/\s+/g, " ").trim(),
+        link: yearLink,
+        searchText: [chatTitle, message.author || "", timestamp, message.text || ""]
+          .join(" ")
+          .toLowerCase()
+      };
+    })
+    .sort((left, right) => {
+      const leftTime = Date.parse(left.timestamp || "") || 0;
+      const rightTime = Date.parse(right.timestamp || "") || 0;
+      return rightTime - leftTime;
+    });
+}
+
+function buildMessageYearlyLink(folderName, timestamp) {
+  const parsed = parseTimestampValue(timestamp);
+
+  if (!parsed) {
+    return `${encodePathPart(folderName)}/latest.html`;
+  }
+
+  return `${encodePathPart(folderName)}/html/${parsed.getFullYear()}.html`;
+}
+
+function buildArchiveSearchHtml(records) {
+  const payload = serializeForInlineScript(records);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teams Archive Search</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef4f9;
+      --panel: #ffffff;
+      --panel-border: #d7e2ec;
+      --text: #172026;
+      --muted: #52606d;
+      --accent: #005a9c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: linear-gradient(180deg, var(--bg) 0%, #f8fbfd 100%);
+      color: var(--text);
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 32px;
+      line-height: 1.1;
+    }
+    .intro {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .search-input {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 14px;
+      margin-bottom: 18px;
+    }
+    .results {
+      display: grid;
+      gap: 12px;
+    }
+    .result {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      box-shadow: 0 10px 30px rgba(9, 30, 66, 0.06);
+    }
+    .result-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .chat-link {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .chat-link:hover {
+      text-decoration: underline;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .snippet {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.5;
+      font-size: 14px;
+    }
+    .empty {
+      display: none;
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      padding: 18px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="intro"><a href="index.html">Back to main index</a></p>
+    <h1>Archive Search</h1>
+    <p class="intro">Search archived messages across all chats by text, author, chat name, or timestamp.</p>
+    <input id="message-search" class="search-input" type="search" placeholder="Search all archived messages..." autocomplete="off">
+    <div id="result-count" class="intro"></div>
+    <section id="results" class="results"></section>
+    <div id="empty" class="empty">No archived messages match your search.</div>
+  </main>
+  <script>
+    (() => {
+      const records = ${payload};
+      const input = document.getElementById("message-search");
+      const results = document.getElementById("results");
+      const empty = document.getElementById("empty");
+      const resultCount = document.getElementById("result-count");
+      const limit = 250;
+
+      const escapeHtml = (value) => String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+
+      const render = () => {
+        const query = String(input.value || "").trim().toLowerCase();
+        const matches = !query
+          ? records.slice(0, limit)
+          : records.filter((record) => record.searchText.includes(query)).slice(0, limit);
+
+        resultCount.textContent = query
+          ? 'Showing ' + matches.length + ' matching messages' + (matches.length === limit ? ' (limited)' : '')
+          : 'Showing latest searchable messages';
+
+        results.innerHTML = matches.map((record) => {
+          return '<article class="result">' +
+            '<div class="result-head">' +
+              '<a class="chat-link" href="' + escapeHtml(record.link) + '">' + escapeHtml(record.chatTitle) + '</a>' +
+              '<span class="meta">' + escapeHtml(record.timestamp || 'Unknown time') + '</span>' +
+            '</div>' +
+            '<div class="meta">' + escapeHtml(record.author || 'Unknown') + '</div>' +
+            '<p class="snippet">' + escapeHtml(record.text || '') + '</p>' +
+          '</article>';
+        }).join('');
+
+        empty.style.display = matches.length === 0 ? 'block' : 'none';
+      };
+
+      input.addEventListener('input', render);
+      render();
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function serializeForInlineScript(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026");
 }
 
 async function syncYearlyHtmlFiles(chatDirectory, yearlyHtmlFiles) {
