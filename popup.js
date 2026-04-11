@@ -484,8 +484,20 @@ function buildArchiveRootIndexHtml(entries) {
   const rowsHtml = entries
     .map((entry) => {
       const latestLink = `${encodePathPart(entry.folderName)}/latest.html`;
+      const chatOrder = Number.isFinite(entry.chatOrder) ? entry.chatOrder : -1;
+      const lastArchivedValue = Date.parse(entry.lastArchivedAt || "") || 0;
+      const firstMessageValue = Date.parse(entry.firstMessageAt || "") || 0;
+      const lastMessageValue = Date.parse(entry.lastMessageAt || "") || 0;
+
       return `
-        <tr>
+        <tr
+          data-chat-order="${escapeHtml(String(chatOrder))}"
+          data-chat-title="${escapeHtml(String(entry.chatTitle || "").toLowerCase())}"
+          data-last-archived="${escapeHtml(String(lastArchivedValue))}"
+          data-messages="${escapeHtml(String(entry.latestMessageCount || 0))}"
+          data-range-start="${escapeHtml(String(firstMessageValue))}"
+          data-range-end="${escapeHtml(String(lastMessageValue))}"
+        >
           <td class="chat-name"><a href="${latestLink}">${escapeHtml(entry.chatTitle)}</a></td>
           <td>${escapeHtml(formatDisplayDate(entry.lastArchivedAt))}</td>
           <td>${escapeHtml(String(entry.latestMessageCount))}</td>
@@ -532,6 +544,27 @@ function buildArchiveRootIndexHtml(entries) {
       margin: 0 0 24px;
       color: var(--muted);
       font-size: 15px;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 0 0 18px;
+      flex-wrap: wrap;
+    }
+    .toolbar label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .sort-select {
+      min-width: 220px;
+      padding: 10px 12px;
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 14px;
     }
     .archive-list {
       background: var(--panel);
@@ -593,6 +626,16 @@ function buildArchiveRootIndexHtml(entries) {
   <main>
     <h1>Teams Archive</h1>
     <p class="intro">Browse archived chats and open each chat overview page. Need message-level search? Open <a href="search.html">archive search</a>.</p>
+    <div class="toolbar">
+      <label for="sort-chats">Sort by</label>
+      <select id="sort-chats" class="sort-select">
+        <option value="teams">Teams order</option>
+        <option value="name">Chat name</option>
+        <option value="archived">Last archived</option>
+        <option value="messages">Message count</option>
+        <option value="range">Chat range</option>
+      </select>
+    </div>
     <section class="archive-list">
       ${
         rowsHtml
@@ -613,6 +656,68 @@ function buildArchiveRootIndexHtml(entries) {
       }
     </section>
   </main>
+  <script>
+    (() => {
+      const sortSelect = document.getElementById("sort-chats");
+      const tbody = document.querySelector("tbody");
+
+      if (!sortSelect || !tbody) {
+        return;
+      }
+
+      const getNumber = (row, key) => Number(row.getAttribute(key) || 0);
+      const getText = (row, key) => String(row.getAttribute(key) || "");
+
+      const compareRows = (left, right, mode) => {
+        if (mode === "name") {
+          return getText(left, "data-chat-title").localeCompare(getText(right, "data-chat-title"));
+        }
+
+        if (mode === "archived") {
+          const diff = getNumber(right, "data-last-archived") - getNumber(left, "data-last-archived");
+          return diff || getText(left, "data-chat-title").localeCompare(getText(right, "data-chat-title"));
+        }
+
+        if (mode === "messages") {
+          const diff = getNumber(right, "data-messages") - getNumber(left, "data-messages");
+          return diff || getText(left, "data-chat-title").localeCompare(getText(right, "data-chat-title"));
+        }
+
+        if (mode === "range") {
+          const diff = getNumber(right, "data-range-end") - getNumber(left, "data-range-end");
+          return diff || getNumber(right, "data-range-start") - getNumber(left, "data-range-start");
+        }
+
+        const leftOrder = getNumber(left, "data-chat-order");
+        const rightOrder = getNumber(right, "data-chat-order");
+        const leftHasOrder = leftOrder >= 0;
+        const rightHasOrder = rightOrder >= 0;
+
+        if (leftHasOrder && rightHasOrder && leftOrder !== rightOrder) {
+          return leftOrder - rightOrder;
+        }
+
+        if (leftHasOrder !== rightHasOrder) {
+          return leftHasOrder ? -1 : 1;
+        }
+
+        return getText(left, "data-chat-title").localeCompare(getText(right, "data-chat-title"));
+      };
+
+      const applySort = () => {
+        const rows = Array.from(tbody.querySelectorAll("tr"));
+        const mode = sortSelect.value || "teams";
+        rows.sort((left, right) => compareRows(left, right, mode));
+
+        for (const row of rows) {
+          tbody.appendChild(row);
+        }
+      };
+
+      sortSelect.addEventListener("change", applySort);
+      applySort();
+    })();
+  </script>
 </body>
 </html>`;
 }
