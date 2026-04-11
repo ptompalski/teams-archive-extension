@@ -48,7 +48,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function archiveCurrentChat(chatLabelOverride = "") {
-  const chatTitle = getChatTitle(chatLabelOverride);
+  const chatTitle = normalizeChatTitle(getChatTitle(chatLabelOverride));
   const chatOrder = getCurrentChatListOrder(chatTitle);
   const collectedMessages = collectMessages();
   await loadOlderMessages(collectedMessages);
@@ -216,6 +216,21 @@ function getChatTitle(chatLabelOverride = "") {
   }
 
   return "teams-chat";
+}
+
+function normalizeChatTitle(value) {
+  const cleaned = String(value || "")
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const commaMatch = cleaned.match(/^([^,]+),\s*([^,+][^,+]*)$/);
+
+  if (commaMatch) {
+    return `${commaMatch[2]} ${commaMatch[1]}`.replace(/\s+/g, " ").trim();
+  }
+
+  return cleaned;
 }
 
 function getCurrentChatListLabel() {

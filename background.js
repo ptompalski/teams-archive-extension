@@ -8,7 +8,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const mergedArchive = message.mergedArchive || snapshot;
     const settings = normalizeSettings(message.settings || {});
     const archiveLabel = buildArchiveLabel(mergedArchive);
-    const folderName = sanitizeFilePart(mergedArchive.chatTitle || archiveLabel) || "teams-chat";
+    const folderName =
+      sanitizeFilePart(cleanDisplayName(mergedArchive.chatTitle || archiveLabel)) || "teams-chat";
     const snapshotStamp = formatTimestampForFile(snapshot.exportedAt || new Date().toISOString());
     const snapshotFilename = `${snapshotStamp}.json`;
     const latestJsonText = JSON.stringify(mergedArchive, null, 2);
@@ -223,7 +224,7 @@ function buildMessageCardsHtml(groups, assetPathPrefix = "") {
       return `
         <article class="message">
           <header class="message-header">
-            <span class="author">${escapeHtml(group.author || "Unknown")}</span>
+            <span class="author">${escapeHtml(cleanDisplayName(group.author || "Unknown"))}</span>
             <time class="timestamp">${escapeHtml(formatTimestampDisplay(group.timestamp || ""))}</time>
           </header>
           <section class="message-body">
@@ -479,6 +480,21 @@ function toTitleToken(value) {
   return value
     .replace(/[^A-Za-z0-9'-]+/g, "")
     .replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "");
+}
+
+function cleanDisplayName(value) {
+  const cleaned = String(value || "")
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const commaMatch = cleaned.match(/^([^,]+),\s*(.+)$/);
+
+  if (commaMatch) {
+    return `${commaMatch[2]} ${commaMatch[1]}`.replace(/\s+/g, " ").trim();
+  }
+
+  return cleaned;
 }
 
 function buildTimePeriodLabel(messages, exportedAt) {

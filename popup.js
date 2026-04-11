@@ -416,11 +416,19 @@ async function rebuildArchiveRootIndex(rootDirectory) {
       continue;
     }
 
+    const latestArchive = await readJsonFileIfExists(entry, "latest.json");
+    const participants = latestArchive?.messages?.length
+      ? listArchiveParticipants(latestArchive.messages)
+      : Array.isArray(manifest.participants)
+        ? manifest.participants.map((name) => cleanDisplayName(name)).filter(Boolean)
+        : [];
+
     entries.push({
       folderName: entry.name,
       chatTitle: String(manifest.chatTitle || manifest.archiveLabel || entry.name),
       archiveLabel: String(manifest.archiveLabel || manifest.chatTitle || entry.name),
       chatOrder: Number.isFinite(Number(manifest.chatOrder)) ? Number(manifest.chatOrder) : -1,
+      participants,
       lastArchivedAt: String(manifest.lastArchivedAt || ""),
       latestMessageCount: Number(manifest.latestMessageCount || 0),
       firstMessageAt: String(manifest.firstMessageAt || ""),
@@ -428,8 +436,6 @@ async function rebuildArchiveRootIndex(rootDirectory) {
       newestSnapshot: String(manifest.newestSnapshot || ""),
       readableFormat: "html"
     });
-
-    const latestArchive = await readJsonFileIfExists(entry, "latest.json");
 
     if (latestArchive?.messages?.length) {
       searchRecords.push(
@@ -488,6 +494,7 @@ function buildArchiveRootIndexHtml(entries) {
       const lastArchivedValue = Date.parse(entry.lastArchivedAt || "") || 0;
       const firstMessageValue = Date.parse(entry.firstMessageAt || "") || 0;
       const lastMessageValue = Date.parse(entry.lastMessageAt || "") || 0;
+      const participantsLabel = (entry.participants || []).join(", ");
 
       return `
         <tr
@@ -499,6 +506,7 @@ function buildArchiveRootIndexHtml(entries) {
           data-range-end="${escapeHtml(String(lastMessageValue))}"
         >
           <td class="chat-name"><a href="${latestLink}">${escapeHtml(entry.chatTitle)}</a></td>
+          <td>${escapeHtml(participantsLabel || "Unknown")}</td>
           <td>${escapeHtml(formatDisplayDate(entry.lastArchivedAt))}</td>
           <td>${escapeHtml(String(entry.latestMessageCount))}</td>
           <td>${escapeHtml(formatRange(entry.firstMessageAt, entry.lastMessageAt))}</td>
@@ -643,6 +651,7 @@ function buildArchiveRootIndexHtml(entries) {
       <thead>
         <tr>
           <th>Chat</th>
+          <th>Chat Users</th>
           <th>Last Archived</th>
           <th>Messages</th>
           <th>Chat Range</th>
@@ -731,11 +740,11 @@ function buildSearchRecords({ folderName, chatTitle, messages }) {
 
       return {
         chatTitle,
-        author: String(message.author || "Unknown"),
+        author: cleanDisplayName(String(message.author || "Unknown")),
         timestamp,
         text: String(message.text || "").replace(/\s+/g, " ").trim(),
         link: yearLink,
-        searchText: [chatTitle, message.author || "", timestamp, message.text || ""]
+        searchText: [chatTitle, cleanDisplayName(message.author || ""), timestamp, message.text || ""]
           .join(" ")
           .toLowerCase()
       };
@@ -921,6 +930,64 @@ function serializeForInlineScript(value) {
     .replace(/&/g, "\\u0026");
 }
 
+function listArchiveParticipants(messages) {
+  const participants = [];
+  const seen = new Set();
+
+  for (const message of messages || []) {
+    const cleaned = cleanDisplayName(message?.author || "");
+
+    if (
+      !cleaned ||
+      cleaned === "Unknown" ||
+      seen.has(cleaned) ||
+      !looksLikePersonDisplayName(cleaned)
+    ) {
+      continue;
+    }
+
+    seen.add(cleaned);
+    participants.push(cleaned);
+  }
+
+  return participants;
+}
+
+function cleanDisplayName(value) {
+  const cleaned = String(value || "")
+    .replace(/\s*\([^)]*\)\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const commaMatch = cleaned.match(/^([^,]+),\s*(.+)$/);
+
+  if (commaMatch) {
+    return `${commaMatch[2]} ${commaMatch[1]}`.replace(/\s+/g, " ").trim();
+  }
+
+  return cleaned;
+}
+
+function looksLikePersonDisplayName(value) {
+  const cleaned = String(value || "").trim();
+
+  if (!cleaned || cleaned.length > 80) {
+    return false;
+  }
+
+  if (/[.!?]/.test(cleaned)) {
+    return false;
+  }
+
+  const parts = cleaned.split(/\s+/).filter(Boolean);
+
+  if (parts.length < 1 || parts.length > 5) {
+    return false;
+  }
+
+  return parts.every((part) => /^(?:[A-Z][\p{L}\p{M}'-]*|[A-Z]\.)$/u.test(part));
+}
+
 async function syncYearlyHtmlFiles(chatDirectory, yearlyHtmlFiles) {
   const htmlDirectory = await getOrCreateDirectory(chatDirectory, "html");
   const wanted = new Set(yearlyHtmlFiles.map((file) => file.filename));
@@ -1011,7 +1078,7 @@ function dedupeAndSortMessages(messages) {
 function normalizeMessage(message) {
   return {
     id: String(message?.id || "").trim(),
-    author: String(message?.author || "").trim() || "Unknown",
+    author: cleanDisplayName(String(message?.author || "").trim()) || "Unknown",
     timestamp: String(message?.timestamp || "").trim(),
     text: String(message?.text || "").replace(/\r/g, "").trim(),
     images: normalizeImages(message?.images)
