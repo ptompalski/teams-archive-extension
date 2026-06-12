@@ -1,10 +1,12 @@
 const archiveButton = document.getElementById("archive-chat-button");
 const archiveVisibleButton = document.getElementById("archive-visible-button");
+const openTeamsButton = document.getElementById("open-teams-button");
 const statusElement = document.getElementById("status");
 const includeImagesCheckbox = document.getElementById("include-images");
 const runIndicatorElement = document.getElementById("run-indicator");
 const runLabelElement = document.getElementById("run-label");
 let progressListenerRegistered = false;
+const TEAMS_WEB_URL = "https://teams.microsoft.com/v2/";
 
 initializePopup().catch((error) => {
   setStatus(error.message || "Could not load settings.", true);
@@ -40,6 +42,14 @@ async function initializePopup() {
 
   includeImagesCheckbox.addEventListener("change", async () => {
     await saveSettings(getSettingsFromForm());
+  });
+
+  openTeamsButton.addEventListener("click", async () => {
+    try {
+      await openTeamsWebsite();
+    } catch (error) {
+      setStatus(error.message || "Could not open the Teams website.", true);
+    }
   });
 }
 
@@ -90,6 +100,31 @@ async function getActiveTeamsTab() {
   }
 
   return activeTab;
+}
+
+async function openTeamsWebsite() {
+  const teamsTabs = await chrome.tabs.query({
+    url: ["https://teams.microsoft.com/*"]
+  });
+  const teamsTab = teamsTabs[0];
+
+  if (teamsTab?.id) {
+    await chrome.tabs.update(teamsTab.id, {
+      active: true
+    });
+
+    if (typeof teamsTab.windowId === "number") {
+      await chrome.windows.update(teamsTab.windowId, {
+        focused: true
+      });
+    }
+
+    return;
+  }
+
+  await chrome.tabs.create({
+    url: TEAMS_WEB_URL
+  });
 }
 
 async function ensureContentScriptLoaded(tabId) {
@@ -188,6 +223,7 @@ async function runArchiveFlow({ mode }) {
 function setBusy(isBusy) {
   archiveButton.disabled = isBusy;
   archiveVisibleButton.disabled = isBusy;
+  openTeamsButton.disabled = isBusy;
   includeImagesCheckbox.disabled = isBusy;
 }
 
@@ -567,6 +603,7 @@ function formatDateForFile(date) {
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
+
 function buildArchiveRootIndexHtml(entries) {
   const rowsHtml = entries
     .map((entry) => {
@@ -581,6 +618,7 @@ function buildArchiveRootIndexHtml(entries) {
         <tr
           data-chat-order="${escapeHtml(String(chatOrder))}"
           data-chat-title="${escapeHtml(String(entry.chatTitle || "").toLowerCase())}"
+          data-chat-users="${escapeHtml(String(participantsLabel || "").toLowerCase())}"
           data-last-archived="${escapeHtml(String(lastArchivedValue))}"
           data-messages="${escapeHtml(String(entry.latestMessageCount || 0))}"
           data-range-start="${escapeHtml(String(firstMessageValue))}"
@@ -640,6 +678,18 @@ function buildArchiveRootIndexHtml(entries) {
       gap: 12px;
       margin: 0 0 18px;
       flex-wrap: wrap;
+    }
+    .search-wrap {
+      margin: 0 0 18px;
+    }
+    .search-input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 14px;
     }
     .toolbar label {
       font-size: 13px;
@@ -715,6 +765,9 @@ function buildArchiveRootIndexHtml(entries) {
   <main>
     <h1>Teams Archive</h1>
     <p class="intro">Browse archived chats and open each chat overview page. Need message-level search? Open <a href="search.html">archive search</a>.</p>
+    <div class="search-wrap">
+      <input id="chat-user-search" class="search-input" type="search" placeholder="Search chat users..." autocomplete="off">
+    </div>
     <div class="toolbar">
       <label for="sort-chats">Sort by</label>
       <select id="sort-chats" class="sort-select">
@@ -748,6 +801,7 @@ function buildArchiveRootIndexHtml(entries) {
   </main>
   <script>
     (() => {
+      const userSearchInput = document.getElementById("chat-user-search");
       const sortSelect = document.getElementById("sort-chats");
       const tbody = document.querySelector("tbody");
 
@@ -794,6 +848,17 @@ function buildArchiveRootIndexHtml(entries) {
         return getText(left, "data-chat-title").localeCompare(getText(right, "data-chat-title"));
       };
 
+      const applyFilter = () => {
+        const query = String(userSearchInput?.value || "").trim().toLowerCase();
+        const rows = Array.from(tbody.querySelectorAll("tr"));
+
+        for (const row of rows) {
+          const users = getText(row, "data-chat-users");
+          const matches = !query || users.includes(query);
+          row.style.display = matches ? "" : "none";
+        }
+      };
+
       const applySort = () => {
         const rows = Array.from(tbody.querySelectorAll("tr"));
         const mode = sortSelect.value || "teams";
@@ -805,7 +870,11 @@ function buildArchiveRootIndexHtml(entries) {
       };
 
       sortSelect.addEventListener("change", applySort);
+      if (userSearchInput) {
+        userSearchInput.addEventListener("input", applyFilter);
+      }
       applySort();
+      applyFilter();
     })();
   </script>
 </body>
