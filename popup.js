@@ -200,12 +200,7 @@ async function runArchiveFlow({ mode }) {
     await rebuildArchiveRootIndex(rootDirectory);
     await validateRootFiles(rootDirectory);
     setRunState("finished");
-    const skippedSuffix = batchResult.skippedCount
-      ? ` Skipped ${batchResult.skippedCount} already archived or unreadable chats.`
-      : "";
-    setStatus(
-      `Finished. Verified ${batchResult.archivedCount} chat archives plus the index and search files.${skippedSuffix}`
-    );
+    setStatus(formatBatchArchiveSummary(batchResult));
   } catch (error) {
     const wasCancelled = error?.name === "AbortError";
     setRunState(wasCancelled ? "idle" : "error");
@@ -246,6 +241,7 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
 
   let archivedCount = 0;
   let skippedCount = 0;
+  const failedChats = [];
   const validatedChats = [];
 
   for (let index = 0; index < chats.length; index += 1) {
@@ -267,7 +263,12 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
     });
 
     if (!openResponse || !openResponse.ok) {
-      setStatus(`Skipped "${chat.label}": ${openResponse?.error || "could not open chat"}`, true);
+      const reason = openResponse?.error || "could not open chat";
+      failedChats.push({
+        label: chat.label,
+        reason
+      });
+      setStatus(`Failed "${chat.label}": ${reason}`, true);
       await wait(1200);
       continue;
     }
@@ -278,14 +279,14 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
       archivedCount += 1;
       validatedChats.push(validation);
     } catch (error) {
-      if (shouldSkipChatError(error)) {
-        skippedCount += 1;
-        setStatus(`Skipped "${chat.label}": ${error.message}`, true);
-        await wait(1200);
-        continue;
-      }
-
-      throw error;
+      const reason = getErrorMessage(error, "unexpected error while archiving chat");
+      failedChats.push({
+        label: chat.label,
+        reason
+      });
+      setStatus(`Failed "${chat.label}": ${reason}`, true);
+      await wait(1200);
+      continue;
     }
 
     await wait(900);
@@ -296,6 +297,7 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
     return {
       archivedCount,
       skippedCount,
+      failedChats,
       validatedChats
     };
   }
@@ -304,6 +306,7 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
   return {
     archivedCount,
     skippedCount,
+    failedChats,
     validatedChats
   };
 }
@@ -334,13 +337,30 @@ async function archiveCurrentChatToFolder(tabId, rootDirectory, settings, chatLa
   return writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedArchive, settings);
 }
 
-function shouldSkipChatError(error) {
-  const message = String(error?.message || "");
+function getErrorMessage(error, fallbackMessage) {
+  const message = String(error?.message || "").trim();
+  return message || fallbackMessage;
+}
 
-  return (
-    message.includes("No messages were found") ||
-    message.includes("The Teams page did not return any data")
-  );
+function formatBatchArchiveSummary(result) {
+  const failedChats = Array.isArray(result.failedChats) ? result.failedChats : [];
+  const lines = [
+    `Finished. Archived ${result.archivedCount} chats successfully, skipped ${result.skippedCount}, failed ${failedChats.length}.`
+  ];
+
+  if (!failedChats.length) {
+    lines.push("Verified the index and search files.");
+    return lines.join("\n");
+  }
+
+  lines.push("Failed chats:");
+
+  for (const failedChat of failedChats) {
+    lines.push(`- ${failedChat.label}: ${failedChat.reason}`);
+  }
+
+  lines.push("Verified the index and search files for successful archives.");
+  return lines.join("\n");
 }
 
 async function rebuildMergedArchive(snapshot) {
