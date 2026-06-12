@@ -165,8 +165,11 @@ async function runArchiveFlow({ mode }) {
     await rebuildArchiveRootIndex(rootDirectory);
     await validateRootFiles(rootDirectory);
     setRunState("finished");
+    const skippedSuffix = batchResult.skippedCount
+      ? ` Skipped ${batchResult.skippedCount} already archived or unreadable chats.`
+      : "";
     setStatus(
-      `Finished. Verified ${batchResult.archivedCount} chat archives plus the index and search files.`
+      `Finished. Verified ${batchResult.archivedCount} chat archives plus the index and search files.${skippedSuffix}`
     );
   } catch (error) {
     const wasCancelled = error?.name === "AbortError";
@@ -211,6 +214,15 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
 
   for (let index = 0; index < chats.length; index += 1) {
     const chat = chats[index];
+    const skipReason = await getExistingArchiveSkipReason(rootDirectory, chat.label);
+
+    if (skipReason) {
+      skippedCount += 1;
+      setStatus(`Skipped "${chat.label}": ${skipReason}`);
+      await wait(300);
+      continue;
+    }
+
     setStatus(`Opening chat ${index + 1} of ${chats.length}: ${chat.label}`);
 
     const openResponse = await chrome.tabs.sendMessage(tabId, {
@@ -486,6 +498,75 @@ async function readJsonFileIfExists(directoryHandle, filename) {
   }
 }
 
+async function getExistingArchiveSkipReason(rootDirectory, chatLabel) {
+  const folderName = buildArchiveFolderNameFromChatLabel(chatLabel);
+
+  if (!folderName) {
+    return "";
+  }
+
+  let chatDirectory;
+
+  try {
+    chatDirectory = await rootDirectory.getDirectoryHandle(folderName);
+  } catch (error) {
+    if (error?.name === "NotFoundError") {
+      return "";
+    }
+
+    throw error;
+  }
+
+  const today = new Date();
+  const todayPrefix = formatDateForFile(today);
+
+  try {
+    const snapshotsDirectory = await chatDirectory.getDirectoryHandle("snapshots");
+
+    for await (const entry of snapshotsDirectory.values()) {
+      if (
+        entry.kind === "file" &&
+        entry.name.startsWith(`${todayPrefix}T`) &&
+        entry.name.endsWith(".json")
+      ) {
+        return "today's snapshot already exists";
+      }
+    }
+  } catch (error) {
+    if (error?.name !== "NotFoundError") {
+      throw error;
+    }
+  }
+
+  const manifest = await readJsonFileIfExists(chatDirectory, "manifest.json");
+
+  if (isSameLocalDate(manifest?.lastArchivedAt, today)) {
+    return "manifest was already archived today";
+  }
+
+  return "";
+}
+
+function buildArchiveFolderNameFromChatLabel(chatLabel) {
+  return sanitizeFilePart(cleanDisplayName(chatLabel)) || "teams-chat";
+}
+
+function isSameLocalDate(value, date) {
+  const parsed = new Date(value || "");
+
+  if (Number.isNaN(parsed.getTime())) {
+    return false;
+  }
+
+  return formatDateForFile(parsed) === formatDateForFile(date);
+}
+
+function formatDateForFile(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
 function buildArchiveRootIndexHtml(entries) {
   const rowsHtml = entries
     .map((entry) => {
