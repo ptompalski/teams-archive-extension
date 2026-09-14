@@ -4,7 +4,11 @@ const folderLabelElement = document.getElementById("folder-label");
 const chooseFolderButton = document.getElementById("choose-folder-button");
 const openTeamsButton = document.getElementById("open-teams-button");
 
-const TEAMS_WEB_URL = "https://teams.microsoft.com/v2/";
+const TEAMS_WEB_URL = "https://teams.cloud.microsoft/";
+const TEAMS_URL_PATTERNS = [
+  "https://teams.cloud.microsoft/*",
+  "https://teams.microsoft.com/*"
+];
 
 initializeViewer().catch((error) => {
   setStatus(error.message || "Could not load archive viewer.", true);
@@ -29,7 +33,7 @@ chooseFolderButton.addEventListener("click", async () => {
 
 openTeamsButton.addEventListener("click", async () => {
   const teamsTabs = await chrome.tabs.query({
-    url: ["https://teams.microsoft.com/*"]
+    url: TEAMS_URL_PATTERNS
   });
   const teamsTab = teamsTabs[0];
 

@@ -5,7 +5,7 @@ This is a Chrome extension that archives Microsoft Teams web chats into a long-t
 ## What it does
 
 - Adds a popup with `Archive Current Chat` and `Archive All Chats` buttons
-- Works with Teams on the web at `https://teams.microsoft.com/v2/`
+- Works with Teams on the web at `https://teams.cloud.microsoft/` and the legacy `https://teams.microsoft.com/` address
 - Scrolls upward in the open chat to load older messages before export
 - Saves each archive run as an immutable snapshot JSON file
 - Rebuilds a merged `latest.json` from all saved snapshots for that chat
@@ -69,7 +69,7 @@ YourArchiveFolder/
 4. Turn on **Developer mode**.
 5. Click **Load unpacked**.
 6. Select the extracted `teams-archive-extension` folder from the repository.
-7. Open Teams on the web at `https://teams.microsoft.com/v2/`.
+7. Open Teams on the web at `https://teams.cloud.microsoft/`.
 8. Open a chat and click the extension icon.
 9. Choose whether to include pasted images.
 10. Click **Archive Current Chat** or **Archive All Chats**.

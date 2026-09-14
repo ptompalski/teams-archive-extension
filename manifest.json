@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Teams Chat Archiver",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Export the currently open Microsoft Teams web chat to a local JSON file.",
   "permissions": [
     "activeTab",
@@ -11,7 +11,8 @@
     "tabs"
   ],
   "host_permissions": [
-    "https://teams.microsoft.com/*"
+    "https://teams.microsoft.com/*",
+    "https://teams.cloud.microsoft/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -23,7 +24,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://teams.microsoft.com/*"
+        "https://teams.microsoft.com/*",
+        "https://teams.cloud.microsoft/*"
       ],
       "js": [
         "content.js"

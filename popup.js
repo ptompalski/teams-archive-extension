@@ -6,7 +6,11 @@ const includeImagesCheckbox = document.getElementById("include-images");
 const runIndicatorElement = document.getElementById("run-indicator");
 const runLabelElement = document.getElementById("run-label");
 let progressListenerRegistered = false;
-const TEAMS_WEB_URL = "https://teams.microsoft.com/v2/";
+const TEAMS_WEB_URL = "https://teams.cloud.microsoft/";
+const TEAMS_URL_PATTERNS = [
+  "https://teams.cloud.microsoft/*",
+  "https://teams.microsoft.com/*"
+];
 
 initializePopup().catch((error) => {
   setStatus(error.message || "Could not load settings.", true);
@@ -95,7 +99,7 @@ async function getActiveTeamsTab() {
     throw new Error("No active browser tab found.");
   }
 
-  if (!activeTab.url.startsWith("https://teams.microsoft.com/")) {
+  if (!isTeamsWebUrl(activeTab.url)) {
     throw new Error("Open Microsoft Teams on the web, then try again.");
   }
 
@@ -104,7 +108,7 @@ async function getActiveTeamsTab() {
 
 async function openTeamsWebsite() {
   const teamsTabs = await chrome.tabs.query({
-    url: ["https://teams.microsoft.com/*"]
+    url: TEAMS_URL_PATTERNS
   });
   const teamsTab = teamsTabs[0];
 
@@ -125,6 +129,19 @@ async function openTeamsWebsite() {
   await chrome.tabs.create({
     url: TEAMS_WEB_URL
   });
+}
+
+function isTeamsWebUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return (
+      parsed.protocol === "https:" &&
+      (parsed.hostname === "teams.cloud.microsoft" ||
+        parsed.hostname === "teams.microsoft.com")
+    );
+  } catch (error) {
+    return false;
+  }
 }
 
 async function ensureContentScriptLoaded(tabId) {
@@ -1515,7 +1532,7 @@ async function fetchImageBlob(sourceUrl, embeddedDataUrl = "") {
 function shouldUseCredentialsForImage(sourceUrl) {
   try {
     const parsed = new URL(sourceUrl);
-    return /(^|\.)teams\.microsoft\.com$/i.test(parsed.hostname);
+    return /(^|\.)(teams\.microsoft\.com|teams\.cloud\.microsoft)$/i.test(parsed.hostname);
   } catch (error) {
     return false;
   }
