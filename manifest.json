@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Teams Chat Archiver",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Export the currently open Microsoft Teams web chat to a local JSON file.",
   "permissions": [
     "activeTab",

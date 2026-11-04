@@ -23,7 +23,18 @@
     <div class="actions">
       <button id="archive-chat-button" type="button">Archive Current Chat</button>
       <button id="archive-visible-button" type="button">Archive All Chats</button>
+      <button id="archive-groups-button" type="button" aria-controls="group-picker" aria-expanded="false">Archive Selected Groups</button>
     </div>
+    <section id="group-picker" class="group-picker" aria-label="Group selection" hidden>
+      <fieldset>
+        <legend>Chat groups</legend>
+        <div id="group-list" class="group-list"></div>
+      </fieldset>
+      <div class="actions">
+        <button id="archive-group-selection-button" type="button" disabled>Archive Groups</button>
+        <button id="cancel-group-selection-button" class="secondary-button" type="button">Cancel</button>
+      </div>
+    </section>
     <div id="run-indicator" class="run-indicator is-idle" aria-live="polite">
       <span class="run-dot" aria-hidden="true"></span>
       <span id="run-label">Idle</span>

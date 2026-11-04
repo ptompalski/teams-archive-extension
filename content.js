@@ -1,4 +1,16 @@
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "LIST_SELECTED_GROUP_CHATS") {
+    listSelectedGroupChats(message.groupIds)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "LIST_CHAT_GROUPS") {
+    sendResponse({ ok: true, payload: listChatGroups() });
+    return false;
+  }
+
   if (message?.type === "PING_TEAMS_ARCHIVER") {
     sendResponse({ ok: true });
     return false;
@@ -20,7 +32,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "OPEN_CHAT_BY_LABEL") {
-    openChatByLabel(message.chatLabel)
+    openChatByLabel(message.chatLabel, message)
       .then((payload) => sendResponse({ ok: true, payload }))
       .catch((error) => {
         sendResponse({
@@ -101,12 +113,248 @@ function listVisibleChats() {
   return chats;
 }
 
-async function openChatByLabel(chatLabel) {
+function getChatGroupElements() {
+  return Array.from(document.querySelectorAll(
+    "[data-conversation-folder='true']:is([data-item-type='custom-folder'], [data-item-type='chats'])"
+  ));
+}
+
+function getChatGroupHeader(group) {
+  return group.querySelector("[data-testid='conversation-folder-header']");
+}
+
+function getChatGroupId(group) {
+  return getChatGroupHeader(group)?.id || group.getAttribute("data-fui-tree-item-value") || "";
+}
+
+function listChatGroups() {
+  return getChatGroupElements().map((group) => {
+    const header = getChatGroupHeader(group);
+    const title = header?.querySelector(".fui-TreeItemLayout__main") || header;
+
+    return {
+      id: getChatGroupId(group),
+      label: normalizeText(title?.textContent || ""),
+      expanded: group.getAttribute("aria-expanded") === "true"
+    };
+  }).filter((group) => group.id && group.label);
+}
+
+function findChatGroup(groupId) {
+  return getChatGroupElements().find((group) => getChatGroupId(group) === groupId) || null;
+}
+
+function getChatListEntryId(entry) {
+  const title = entry.querySelector("[id^='title-chat-list-item_']");
+  return title?.id.slice("title-chat-list-item_".length) || "";
+}
+
+function getChatsInGroup(group) {
+  const entries = Array.from(group.querySelectorAll(
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
+  )).filter((entry) => entry.closest("[data-conversation-folder='true']") === group);
+
+  return entries.map((entry, order) => ({
+    id: getChatListEntryId(entry),
+    label: getChatListEntryLabel(entry),
+    groupId: getChatGroupId(group),
+    order
+  })).filter((chat) => chat.id && chat.label);
+}
+
+function getChatGroupScrollContainer(group) {
+  for (let ancestor = group; ancestor; ancestor = ancestor.parentElement) {
+    const overflow = window.getComputedStyle(ancestor).overflowY;
+
+    if (ancestor.clientHeight > 0 && /auto|scroll/.test(overflow)) {
+      return ancestor;
+    }
+
+    if (ancestor.matches("[data-tid='app-layout-area--mid-nav']")) {
+      break;
+    }
+  }
+
+  return null;
+}
+
+async function expandChatGroup(groupId) {
+  let group = findChatGroup(groupId);
+
+  if (!group) {
+    throw new Error("A selected chat group is no longer available. Reload the group list and try again.");
+  }
+
+  if (group.getAttribute("aria-expanded") !== "true") {
+    const header = getChatGroupHeader(group);
+
+    if (!header) {
+      throw new Error("Could not find the selected group's expansion control.");
+    }
+
+    header.scrollIntoView({ block: "nearest" });
+    clickElement(header);
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await wait(200);
+      group = findChatGroup(groupId);
+
+      if (group?.getAttribute("aria-expanded") === "true") {
+        break;
+      }
+    }
+  }
+
+  if (group?.getAttribute("aria-expanded") !== "true") {
+    throw new Error("Could not expand the selected chat group.");
+  }
+
+  await wait(500);
+  return group;
+}
+
+async function scanChatGroup(groupId, targetChatId = "") {
+  let group = await expandChatGroup(groupId);
+  const scrollContainer = getChatGroupScrollContainer(group);
+  const originalScrollTop = scrollContainer?.scrollTop || 0;
+  const chats = new Map();
+  let stableRounds = 0;
+  let loadingRounds = 0;
+  let requestedPage = "";
+
+  try {
+    if (scrollContainer) {
+      scrollContainer.scrollTop = 0;
+      dispatchScrollEvents(scrollContainer);
+      await wait(500);
+    }
+
+    for (let round = 0; round < 200; round += 1) {
+      group = findChatGroup(groupId);
+
+      if (!group || group.getAttribute("aria-expanded") !== "true") {
+        throw new Error("The selected chat group disappeared or collapsed while reading it.");
+      }
+
+      const previousCount = chats.size;
+      const visibleChats = getChatsInGroup(group);
+
+      for (const chat of visibleChats) {
+        if (!chats.has(chat.id)) {
+          chats.set(chat.id, chat);
+        }
+      }
+
+      if (targetChatId) {
+        const entry = Array.from(group.querySelectorAll(
+          "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
+        )).find((item) => getChatListEntryId(item) === targetChatId);
+
+        if (entry) {
+          return { chats: Array.from(chats.values()), entry };
+        }
+      }
+
+      const more = Array.from(group.querySelectorAll("[data-testid='load-next-page-button']"))
+        .find((button) => button.closest("[data-conversation-folder='true']") === group);
+      const busy = group.matches("[aria-busy='true']") ||
+        group.querySelector("[aria-busy='true'], [role='progressbar']");
+
+      if (more || busy) {
+        const pageKey = JSON.stringify(Array.from(group.querySelectorAll("[role='treeitem']"))
+          .map((entry) => entry.getAttribute("data-fui-tree-item-value") ||
+            entry.querySelector("[id^='title-chat-list-item_']")?.id || entry.textContent));
+
+        if (more && !busy && pageKey !== requestedPage &&
+            more.getAttribute("aria-disabled") !== "true" && !more.hasAttribute("disabled")) {
+          more.scrollIntoView({ block: "nearest" });
+          clickElement(more);
+          requestedPage = pageKey;
+          loadingRounds = 0;
+
+          if (scrollContainer) {
+            scrollContainer.scrollTop = 0;
+            dispatchScrollEvents(scrollContainer);
+          }
+        } else {
+          loadingRounds += 1;
+        }
+
+        if (loadingRounds >= 20) {
+          throw new Error("Teams stopped loading chats in a selected group. No partial group list was archived.");
+        }
+
+        stableRounds = 0;
+        await wait(500);
+        continue;
+      }
+
+      loadingRounds = 0;
+      const atBottom = !scrollContainer ||
+        scrollContainer.scrollTop + scrollContainer.clientHeight >= scrollContainer.scrollHeight - 2;
+
+      if (atBottom && chats.size === previousCount) {
+        stableRounds += 1;
+
+        if (stableRounds >= 4) {
+          if (targetChatId) {
+            throw new Error("The requested chat could not be found in its selected group.");
+          }
+
+          return { chats: Array.from(chats.values()), entry: null };
+        }
+      } else {
+        stableRounds = 0;
+      }
+
+      if (scrollContainer && !atBottom) {
+        scrollContainer.scrollTop += Math.max(100, scrollContainer.clientHeight * 0.8);
+        dispatchScrollEvents(scrollContainer);
+      }
+
+      await wait(500);
+    }
+
+    throw new Error("The selected group could not be fully read within the safety limit. No partial group list was archived.");
+  } finally {
+    if (scrollContainer && !targetChatId) {
+      scrollContainer.scrollTop = originalScrollTop;
+      dispatchScrollEvents(scrollContainer);
+    }
+  }
+}
+
+async function listSelectedGroupChats(groupIds) {
+  if (!Array.isArray(groupIds) || !groupIds.length ||
+      groupIds.some((groupId) => typeof groupId !== "string" || !groupId)) {
+    throw new Error("Select at least one chat group.");
+  }
+
+  const chats = new Map();
+
+  for (const groupId of new Set(groupIds)) {
+    const label = listChatGroups().find((group) => group.id === groupId)?.label;
+    notifyProgress(`Reading chat group: ${label || groupId}...`);
+    const result = await scanChatGroup(groupId);
+
+    for (const chat of result.chats) {
+      if (!chats.has(chat.id)) {
+        chats.set(chat.id, { ...chat, order: chats.size });
+      }
+    }
+  }
+
+  return Array.from(chats.values());
+}
+
+async function openChatByLabel(chatLabel, { chatId = "", groupId = "" } = {}) {
   if (!chatLabel) {
     throw new Error("No chat label was provided.");
   }
 
-  const chatEntry = findChatListEntry(chatLabel);
+  const chatEntry = groupId && chatId
+    ? (await scanChatGroup(groupId, chatId)).entry
+    : findChatListEntry(chatLabel);
 
   if (!chatEntry) {
     throw new Error(`Could not find the chat "${chatLabel}" in the visible Teams chat list.`);
@@ -235,9 +483,9 @@ function normalizeChatTitle(value) {
 
 function getCurrentChatListLabel() {
   const selectedSelectors = [
-    "[role='treeitem'][data-item-type='chat'][aria-selected='true']",
-    "[role='treeitem'][data-testid='list-item'][data-item-type='chat'][aria-selected='true']",
-    "[role='treeitem'][data-item-type='chat'][aria-current='true']"
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-selected='true']",
+    "[role='treeitem'][data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-selected='true']",
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-current='true']"
   ];
 
   for (const selector of selectedSelectors) {
@@ -293,7 +541,7 @@ function looksLikeChatListEntry(element) {
 
   if (
     element.matches(
-      "[role='treeitem'][data-testid='list-item'][data-item-type='chat'], [role='treeitem'][data-item-type='chat']"
+      "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
     )
   ) {
     return true;
@@ -412,9 +660,9 @@ function findChatListEntry(chatLabel) {
 
 function getChatListEntries() {
   const selectors = [
-    "[role='treeitem'][data-testid='list-item'][data-item-type='chat']",
-    "[role='treeitem'][data-item-type='chat']",
-    "[data-testid='list-item'][data-item-type='chat']"
+    "[role='treeitem'][data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])",
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])",
+    "[data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
   ];
 
   const entries = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));

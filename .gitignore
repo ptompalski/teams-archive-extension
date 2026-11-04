@@ -8,4 +8,5 @@ Thumbs.db
 
 # extension test artifacts or saved page dumps
 *.html
+!/tests/group-archive.html
 *.png

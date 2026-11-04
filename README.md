@@ -1,6 +1,6 @@
 # Teams Chat Archiver
 
-Teams Chat Archiver is a Chrome extension for saving a local copy of conversations from Microsoft Teams on the web. It can archive the chat you currently have open or work through all chats visible in your Teams chat list.
+Teams Chat Archiver is a Chrome extension for saving a local copy of conversations from Microsoft Teams on the web. It can archive the chat you currently have open, chats in selected sidebar groups, or all chats visible in your Teams chat list.
 
 Use it when you want to keep an accessible, long-term record of important conversations outside the Teams interface. The extension copies messages and, optionally, pasted images into a folder you choose. It does not remove or change anything in Teams.
 
@@ -18,11 +18,23 @@ The browsing webpage uses files stored inside the archive folder. It does not re
 ## Main features
 
 - Archives the currently open chat or all chats visible in the Teams chat list
+- Archives selected sidebar groups, including Favorites and custom groups, with muted chats included
 - Works with Teams at `https://teams.cloud.microsoft/`
 - Scrolls through each chat to collect older messages that are available in the Teams page
 - Keeps a new snapshot from every archive run and combines snapshots into the latest record
 - Creates a main `index.html` page linking to every archived chat
 - Creates a summary page and readable yearly transcript pages for each chat
+
+## Archive selected groups
+
+1. Open the Teams chat list and click the extension icon.
+2. Click **Archive Selected Groups** to load the sidebar groups.
+3. Check one or more groups, such as Favorites, CAT, or other.
+4. Click **Archive Groups** and choose your archive folder.
+
+The extension expands selected groups, follows their **See more** controls, and scrolls the sidebar to collect chat rows. Selected groups can remain expanded after the run. Chats appearing in multiple selected groups are collected once by chat ID. Channels inside a group are not included.
+
+If Teams stops loading a group or the safety limit is reached, the selected-group run stops before archiving any chats rather than using a known partial list. Changing the active Teams tab after loading the group picker requires reloading the group list. Existing same-day archive skipping still applies, and the archive folder structure does not change.
 
 ## Browse the archive
 
@@ -63,6 +75,7 @@ Each run adds a dated file under `snapshots/`. The extension combines those snap
 ## Current limitations
 
 - Batch mode only archives chats that are currently visible in the Teams chat list
+- Selected-group mode attempts to load all chats in the chosen groups, but depends on Teams exposing its group, pagination, and scrolling controls correctly
 - Teams changes its HTML structure often, so selectors may need adjustment over time
 - Snapshot merging deduplicates by message id when present, otherwise by author + timestamp + text + image source
 - Only pasted inline images are currently archived
@@ -82,8 +95,12 @@ Each run adds a dated file under `snapshots/`. The extension combines those snap
 7. Open Teams on the web at `https://teams.cloud.microsoft/`.
 8. Open a chat and click the extension icon.
 9. Choose whether to include pasted images.
-10. Click **Archive Current Chat** or **Archive All Chats**.
+10. Click **Archive Current Chat**, **Archive All Chats**, or **Archive Selected Groups**. For selected groups, check the groups and click **Archive Groups**.
 11. Choose the root folder where you want the archive stored.
 12. After the tool finishes, which may take a while for larger chats, open that archive folder and open `index.html` to browse the archived chats.
 
 While the tool is running, avoid interacting with the Teams tab. You can switch to another tab or another application, but do not click, scroll, change chats, or navigate away in the Teams tab until the status shows that the archive is finished.
+
+## Development checks
+
+Serve the repository root with a local static HTTP server, then open `/tests/group-archive.html` in a browser. The dependency-free regression page tests the actual content and popup scripts against synthetic Teams markup and mocked extension APIs. It covers group boundaries, muted chats, deduplication, expansion, pagination, virtualized rows, error handling, and popup routing. It does not access Teams or write archives.
