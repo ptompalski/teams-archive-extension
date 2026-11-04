@@ -235,9 +235,9 @@ function normalizeChatTitle(value) {
 
 function getCurrentChatListLabel() {
   const selectedSelectors = [
-    "[role='treeitem'][data-item-type='chat'][aria-selected='true']",
-    "[role='treeitem'][data-testid='list-item'][data-item-type='chat'][aria-selected='true']",
-    "[role='treeitem'][data-item-type='chat'][aria-current='true']"
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-selected='true']",
+    "[role='treeitem'][data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-selected='true']",
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-current='true']"
   ];
 
   for (const selector of selectedSelectors) {
@@ -293,7 +293,7 @@ function looksLikeChatListEntry(element) {
 
   if (
     element.matches(
-      "[role='treeitem'][data-testid='list-item'][data-item-type='chat'], [role='treeitem'][data-item-type='chat']"
+      "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
     )
   ) {
     return true;
@@ -412,9 +412,9 @@ function findChatListEntry(chatLabel) {
 
 function getChatListEntries() {
   const selectors = [
-    "[role='treeitem'][data-testid='list-item'][data-item-type='chat']",
-    "[role='treeitem'][data-item-type='chat']",
-    "[data-testid='list-item'][data-item-type='chat']"
+    "[role='treeitem'][data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])",
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])",
+    "[data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
   ];
 
   const entries = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
