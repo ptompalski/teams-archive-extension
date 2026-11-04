@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Group archive tests</title></head>
+<body>
+  <h1>Group archive tests</h1>
+  <pre id="results" aria-live="polite"></pre>
+  <script>
+    (async () => {
+      const results = document.getElementById("results");
+      const contentSource = await (await fetch("../content.js")).text();
+      const popupSource = await (await fetch("../popup.js")).text();
+      const popupMarkup = await (await fetch("../popup.html")).text();
+      const failures = [];
+      let passed = 0;
+      const assert = (condition, message) => {
+        if (!condition) throw new Error(message);
+      };
+      const parse = (markup) => new DOMParser().parseFromString(markup, "text/html");
+      const chat = (id, label, type = "chat") =>
+        `<div role="treeitem" data-item-type="${type}"><span id="title-chat-list-item_${id}">${label}</span></div>`;
+      const folder = (id, label, children = "", expanded = true, type = "custom-folder") =>
+        `<div role="treeitem" data-conversation-folder="true" data-item-type="${type}" aria-expanded="${expanded}"><div id="${id}" data-testid="conversation-folder-header"><div class="fui-TreeItemLayout__main">${label}</div></div><div role="group">${children}</div></div>`;
+      const loadContent = (fixture, tick = async () => {}) => new Function(
+        "document", "window", "chrome", "testWait", contentSource +
+        "\nwait = testWait; return {listChatGroups, getChatsInGroup, findChatGroup, listSelectedGroupChats, scanChatGroup, listVisibleChats};"
+      )(fixture, {
+        getComputedStyle: (element) => ({ overflowY: element.id === "rail" ? "auto" : "visible" }),
+        dispatchEvent() {}
+      }, { runtime: { onMessage: { addListener() {} }, sendMessage() {} } }, tick);
+      const test = async (name, check) => {
+        try {
+          await check();
+          passed += 1;
+          results.textContent += `PASS ${name}\n`;
+        } catch (error) {
+          failures.push(`${name}: ${error.message}`);
+          results.textContent += `FAIL ${name}: ${error.message}\n`;
+        }
+      };
+      const rejects = async (operation, pattern) => {
+        try { await operation(); } catch (error) {
+          assert(pattern.test(error.message), error.message);
+          return;
+        }
+        throw new Error("Expected an error");
+      };
+
+      await test("Group boundaries, muted chats, channels and cross-group deduplication", async () => {
+        const fixture = parse(
+          folder("favorites", "Favourites", chat("shared", "Shared conversation")) +
+          folder("cat", "CAT", chat("cat-only", "CAT chat") + chat("shared", "Shared conversation")) +
+          folder("other", "other", chat("muted", "Muted chat", "muted-chat") + chat("channel", "Channel", "channel")) +
+          folder("quick", "Quick views", "", true, "quick-views")
+        );
+        const api = loadContent(fixture);
+        assert(api.listChatGroups().map(group => group.label).join() === "Favourites,CAT,other", "Wrong groups");
+        const selected = await api.listSelectedGroupChats(["cat", "other", "cat"]);
+        assert(selected.map(entry => entry.id).join() === "cat-only,shared,muted", "Wrong selection or order");
+        const all = await api.listSelectedGroupChats(["favorites", "cat", "other"]);
+        assert(all.length === 3 && all.every((entry, order) => entry.order === order), "Deduplication failed");
+        assert(api.listVisibleChats().length === 3, "Visible chat behavior regressed");
+      });
+
+      await test("Collapsed groups expand before collection", async () => {
+        const fixture = parse(folder("cat", "CAT", "", false));
+        fixture.getElementById("cat").addEventListener("click", () => {
+          const group = fixture.getElementById("cat").parentElement;
+          group.setAttribute("aria-expanded", "true");
+          group.querySelector("[role='group']").innerHTML = chat("hidden", "Hidden chat");
+        });
+        assert((await loadContent(fixture).listSelectedGroupChats(["cat"]))[0].id === "hidden", "Hidden chat missed");
+      });
+
+      await test("Pagination loads successive pages including channel-only pages", async () => {
+        const fixture = parse(folder("cat", "CAT", chat("channel-one", "Channel one", "channel") +
+          '<div data-testid="load-next-page-button">See more</div>'));
+        const group = fixture.querySelector("[role='group']");
+        const more = fixture.querySelector("[data-testid='load-next-page-button']");
+        let pages = 0;
+        more.addEventListener("click", () => {
+          pages += 1;
+          more.insertAdjacentHTML("beforebegin", pages === 1
+            ? chat("channel-two", "Channel two", "channel") : chat("last", "Last chat", "muted-chat"));
+          if (pages === 2) more.remove();
+        });
+        const selected = await loadContent(fixture).listSelectedGroupChats(["cat"]);
+        assert(pages === 2 && selected.length === 1 && selected[0].id === "last", "Pagination incomplete");
+        assert(group.querySelectorAll("[data-item-type='channel']").length === 2, "Fixture pagination failed");
+      });
+
+      await test("Virtualized rows accumulate and can be reopened by chat ID", async () => {
+        const fixture = parse(`<div id="rail">${folder("cat", "CAT")}</div>`);
+        const rail = fixture.getElementById("rail");
+        const children = fixture.querySelector("[role='group']");
+        let position = 0;
+        const render = () => { children.innerHTML = chat(`chat-${Math.floor(position / 100)}`, "Same label"); };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 100 }, scrollHeight: { value: 300 },
+          scrollTop: { get: () => position, set: (value) => { position = Math.max(0, Math.min(200, value)); render(); } }
+        });
+        render();
+        const api = loadContent(fixture);
+        const selected = await api.listSelectedGroupChats(["cat"]);
+        assert(selected.map(entry => entry.id).join() === "chat-0,chat-1,chat-2", "Virtual rows missed");
+        assert(position === 0, "List scroll was not restored");
+        const opened = await api.scanChatGroup("cat", "chat-2");
+        assert(opened.entry.querySelector("span").id === "title-chat-list-item_chat-2", "Wrong identity reopened");
+      });
+
+      await test("Stalled pagination, missing groups, empty selection and expansion failure reject", async () => {
+        const fixture = parse(folder("cat", "CAT", '<div data-testid="load-next-page-button">See more</div>') +
+          folder("closed", "Closed", "", false));
+        const api = loadContent(fixture);
+        await rejects(() => api.listSelectedGroupChats(["cat"]), /stopped loading/);
+        await rejects(() => api.listSelectedGroupChats(["missing"]), /no longer available/);
+        await rejects(() => api.listSelectedGroupChats([]), /at least one/);
+        await rejects(() => api.listSelectedGroupChats(["closed"]), /Could not expand/);
+      });
+
+      await test("Popup selection, batch routing, busy state, cancellation and tab safety", async () => {
+        const fixture = parse(popupMarkup);
+        const messages = [];
+        const archived = [];
+        let activeTabId = 7;
+        const chromeStub = {
+          storage: { local: { get: async defaults => defaults, set: async () => {} } },
+          runtime: { onMessage: { addListener() {} } },
+          tabs: {
+            query: async () => [{ id: activeTabId, url: "https://teams.cloud.microsoft/" }],
+            sendMessage: async (tabId, message) => {
+              messages.push(message);
+              if (message.type === "LIST_CHAT_GROUPS") return { ok: true, payload: [{ id: "cat", label: "CAT" }, { id: "other", label: "other" }] };
+              if (message.type === "LIST_SELECTED_GROUP_CHATS") {
+                assert(fixture.getElementById("archive-group-selection-button").disabled, "Start not disabled while running");
+                return { ok: true, payload: [{ id: "selected", label: "Selected chat", groupId: "cat" }] };
+              }
+              if (message.type === "LIST_VISIBLE_CHATS") return { ok: true, payload: [{ label: "Visible chat" }] };
+              return { ok: true };
+            }
+          }
+        };
+        const testWindow = { showDirectoryPicker: async () => ({}) };
+        const api = new Function("document", "window", "chrome", "archived", popupSource + `
+          wait = async () => {};
+          getExistingArchiveSkipReason = async () => "";
+          archiveCurrentChatToFolder = async (tabId, directory, settings, label) => { archived.push(label || "current"); return {}; };
+          rebuildArchiveRootIndex = async () => {};
+          validateRootFiles = async () => {};
+          return {loadChatGroupSelection, runArchiveFlow, setBusy};
+        `)(fixture, testWindow, chromeStub, archived);
+        await api.loadChatGroupSelection();
+        const start = fixture.getElementById("archive-group-selection-button");
+        assert(start.disabled, "Empty selection enabled");
+        const checkbox = fixture.querySelector("#group-list input");
+        checkbox.checked = true;
+        checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+        assert(!start.disabled, "Selected group disabled");
+        await api.runArchiveFlow({ mode: "groups", groupIds: ["cat"] });
+        assert(archived.join() === "Selected chat", "Wrong chats archived");
+        assert(messages.some(message => message.type === "LIST_SELECTED_GROUP_CHATS" && message.groupIds.join() === "cat"), "Wrong group request");
+        assert(messages.some(message => message.type === "OPEN_CHAT_BY_LABEL" && message.chatId === "selected" && message.groupId === "cat"), "Chat identity lost");
+        assert(!start.disabled && !checkbox.disabled, "Controls not restored");
+        await api.runArchiveFlow({ mode: "visible" });
+        await api.runArchiveFlow({ mode: "current" });
+        assert(archived.join() === "Selected chat,Visible chat,current", "Existing actions regressed");
+        const count = messages.length;
+        activeTabId = 8;
+        await api.runArchiveFlow({ mode: "groups", groupIds: ["cat"] });
+        assert(messages.length === count && fixture.getElementById("status").textContent.includes("tab changed"), "Tab mismatch not rejected");
+        testWindow.showDirectoryPicker = async () => { throw new DOMException("Cancelled", "AbortError"); };
+        await api.runArchiveFlow({ mode: "groups", groupIds: ["cat"] });
+        assert(fixture.getElementById("status").textContent === "Archive cancelled." && !start.disabled, "Cancellation recovery failed");
+        fixture.getElementById("cancel-group-selection-button").click();
+        assert(fixture.getElementById("group-picker").hidden, "Cancel did not close picker");
+      });
+
+      window.testResults = { passed, failures };
+      results.textContent += `\n${passed} passed; ${failures.length} failed.\n`;
+    })().catch(error => {
+      window.testResults = { passed: 0, failures: [error.message] };
+      document.getElementById("results").textContent += error.stack;
+    });
+  </script>
+</body>
+</html>

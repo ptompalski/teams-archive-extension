@@ -6,7 +6,9 @@ body {
 }
 
 .popup {
-  width: 320px;
+  box-sizing: border-box;
+  width: 352px;
+  max-width: 100%;
   padding: 16px;
 }
 
@@ -83,6 +85,48 @@ button {
 
 .quick-actions {
   margin-bottom: 14px;
+}
+
+.group-picker {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #cbd5e1;
+}
+
+.group-picker fieldset {
+  min-width: 0;
+  margin: 0 0 12px;
+  padding: 0;
+  border: 0;
+}
+
+.group-picker legend {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.group-list {
+  max-height: 192px;
+  overflow-y: auto;
+}
+
+.group-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  font-size: 13px;
+}
+
+.group-option input {
+  flex: 0 0 18px;
+  margin: 0;
+}
+
+.group-option span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .run-indicator {

@@ -1,11 +1,18 @@
 const archiveButton = document.getElementById("archive-chat-button");
 const archiveVisibleButton = document.getElementById("archive-visible-button");
+const archiveGroupsButton = document.getElementById("archive-groups-button");
+const archiveGroupSelectionButton = document.getElementById("archive-group-selection-button");
+const cancelGroupSelectionButton = document.getElementById("cancel-group-selection-button");
+const groupPickerElement = document.getElementById("group-picker");
+const groupListElement = document.getElementById("group-list");
 const openTeamsButton = document.getElementById("open-teams-button");
 const statusElement = document.getElementById("status");
 const includeImagesCheckbox = document.getElementById("include-images");
 const runIndicatorElement = document.getElementById("run-indicator");
 const runLabelElement = document.getElementById("run-label");
 let progressListenerRegistered = false;
+let groupSelectionTabId = null;
+let isBusy = false;
 const TEAMS_WEB_URL = "https://teams.cloud.microsoft/";
 const TEAMS_URL_PATTERNS = [
   "https://teams.cloud.microsoft/*",
@@ -184,21 +191,97 @@ archiveVisibleButton.addEventListener("click", async () => {
   });
 });
 
-async function runArchiveFlow({ mode }) {
+archiveGroupsButton.addEventListener("click", loadChatGroupSelection);
+
+groupListElement.addEventListener("change", updateGroupArchiveButton);
+
+cancelGroupSelectionButton.addEventListener("click", () => {
+  groupPickerElement.hidden = true;
+  archiveGroupsButton.setAttribute("aria-expanded", "false");
+  archiveGroupsButton.focus();
+});
+
+archiveGroupSelectionButton.addEventListener("click", async () => {
+  const groupIds = Array.from(groupListElement.querySelectorAll("input:checked"))
+    .map((input) => input.value);
+
+  if (groupIds.length) {
+    await runArchiveFlow({ mode: "groups", groupIds });
+  }
+});
+
+function updateGroupArchiveButton() {
+  archiveGroupSelectionButton.disabled = isBusy || !groupListElement.querySelector("input:checked");
+}
+
+async function loadChatGroupSelection() {
+  setBusy(true);
+  setRunState("running");
+  setStatus("Reading Teams chat groups...");
+
+  try {
+    const activeTab = await getActiveTeamsTab();
+    await ensureContentScriptLoaded(activeTab.id);
+    const response = await chrome.tabs.sendMessage(activeTab.id, { type: "LIST_CHAT_GROUPS" });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Could not read Teams chat groups.");
+    }
+
+    if (!response.payload?.length) {
+      throw new Error("No chat groups were found. Open the Teams chat list and try again.");
+    }
+
+    groupSelectionTabId = activeTab.id;
+    groupListElement.replaceChildren();
+
+    for (const group of response.payload) {
+      const label = document.createElement("label");
+      label.className = "group-option";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = group.id;
+      const title = document.createElement("span");
+      title.textContent = group.label;
+      label.append(checkbox, title);
+      groupListElement.append(label);
+    }
+
+    groupPickerElement.hidden = false;
+    archiveGroupsButton.setAttribute("aria-expanded", "true");
+    setRunState("idle");
+    setStatus("");
+  } catch (error) {
+    groupSelectionTabId = null;
+    groupListElement.replaceChildren();
+    groupPickerElement.hidden = true;
+    archiveGroupsButton.setAttribute("aria-expanded", "false");
+    setRunState("error");
+    setStatus(error.message || "Could not read Teams chat groups.", true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function runArchiveFlow({ mode, groupIds = [] }) {
   setBusy(true);
   ensureProgressListener();
   setRunState("running");
   setStatus("Choose an archive folder...");
 
   try {
-    const settings = getSettingsFromForm();
-    await saveSettings(settings);
-
     const rootDirectory = await window.showDirectoryPicker({
       mode: "readwrite"
     });
 
+    const settings = getSettingsFromForm();
+    await saveSettings(settings);
     const activeTab = await getActiveTeamsTab();
+
+    if (mode === "groups" && activeTab.id !== groupSelectionTabId) {
+      throw new Error("The active Teams tab changed. Reload the group list and try again.");
+    }
+
     await ensureContentScriptLoaded(activeTab.id);
 
     if (mode === "current") {
@@ -213,7 +296,9 @@ async function runArchiveFlow({ mode }) {
       return;
     }
 
-    const batchResult = await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings);
+    const batchResult = await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings, {
+      groupIds: mode === "groups" ? groupIds : null
+    });
     await rebuildArchiveRootIndex(rootDirectory);
     await validateRootFiles(rootDirectory);
     setRunState("finished");
@@ -232,28 +317,38 @@ async function runArchiveFlow({ mode }) {
   }
 }
 
-function setBusy(isBusy) {
-  archiveButton.disabled = isBusy;
-  archiveVisibleButton.disabled = isBusy;
-  openTeamsButton.disabled = isBusy;
-  includeImagesCheckbox.disabled = isBusy;
+function setBusy(busy) {
+  isBusy = busy;
+  archiveButton.disabled = busy;
+  archiveVisibleButton.disabled = busy;
+  archiveGroupsButton.disabled = busy;
+  cancelGroupSelectionButton.disabled = busy;
+  openTeamsButton.disabled = busy;
+  includeImagesCheckbox.disabled = busy;
+  groupListElement.querySelectorAll("input").forEach((input) => {
+    input.disabled = busy;
+  });
+  updateGroupArchiveButton();
 }
 
-async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
-  setStatus("Reading visible Teams chats...");
+async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings, { groupIds = null } = {}) {
+  setStatus(groupIds === null ? "Reading visible Teams chats..." : "Reading selected Teams chat groups...");
 
   const listResponse = await chrome.tabs.sendMessage(tabId, {
-    type: "LIST_VISIBLE_CHATS"
+    type: groupIds === null ? "LIST_VISIBLE_CHATS" : "LIST_SELECTED_GROUP_CHATS",
+    ...(groupIds === null ? {} : { groupIds })
   });
 
   if (!listResponse || !listResponse.ok) {
-    throw new Error(listResponse?.error || "Could not read the visible Teams chat list.");
+    throw new Error(listResponse?.error || "Could not read the requested Teams chat list.");
   }
 
   const chats = listResponse.payload || [];
 
   if (!chats.length) {
-    throw new Error("No chats were found in the current Teams view.");
+    throw new Error(groupIds === null
+      ? "No chats were found in the current Teams view."
+      : "No chats were found in the selected groups. Channels are not included.");
   }
 
   let archivedCount = 0;
@@ -276,7 +371,9 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings) {
 
     const openResponse = await chrome.tabs.sendMessage(tabId, {
       type: "OPEN_CHAT_BY_LABEL",
-      chatLabel: chat.label
+      chatLabel: chat.label,
+      chatId: chat.id || "",
+      groupId: chat.groupId || ""
     });
 
     if (!openResponse || !openResponse.ok) {
