@@ -1341,18 +1341,30 @@ async function rebuildFromSnapshots(snapshotsDirectory, fallbackArchive) {
 }
 
 function dedupeAndSortMessages(messages) {
-  const seen = new Set();
+  const byKey = new Map();
   const deduped = [];
 
   for (const message of messages) {
     const normalized = normalizeMessage(message);
     const key = buildMessageKey(normalized);
 
-    if (seen.has(key)) {
+    const previous = byKey.get(key);
+
+    if (previous) {
+      if (previous.threadId || normalized.threadId) {
+        previous.threadId = normalized.threadId || previous.threadId;
+        if (normalized.deleted) {
+          previous.deleted = true;
+        }
+        previous.text = normalized.text.length >= previous.text.length ? normalized.text : previous.text;
+        previous.author = normalized.author !== "Unknown" ? normalized.author : previous.author;
+        previous.timestamp = normalized.timestamp || previous.timestamp;
+        previous.images = normalizeImages([...previous.images, ...normalized.images]);
+      }
       continue;
     }
 
-    seen.add(key);
+    byKey.set(key, normalized);
     deduped.push(normalized);
   }
 
@@ -1362,6 +1374,8 @@ function dedupeAndSortMessages(messages) {
 function normalizeMessage(message) {
   return {
     id: String(message?.id || "").trim(),
+    ...(message?.threadId ? { threadId: String(message.threadId).trim() } : {}),
+    ...(message?.deleted === true ? { deleted: true } : {}),
     author: cleanDisplayName(String(message?.author || "").trim()) || "Unknown",
     timestamp: String(message?.timestamp || "").trim(),
     text: String(message?.text || "").replace(/\r/g, "").trim(),

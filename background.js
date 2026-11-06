@@ -214,7 +214,12 @@ function buildMessageCardsHtml(groups, assetPathPrefix = "") {
             })
             .join("\n");
 
-          return `<div class="message-part-wrap">
+          const threadHtml = part.threadId
+            ? `<p class="meta">${part.threadId === part.id ? "Post" : "Reply to post"} ${escapeHtml(part.threadId)}</p>`
+            : "";
+
+          return `<div class="message-part-wrap" id="message-${escapeHtml(part.id || "")}">
+            ${threadHtml}
             <pre class="message-part">${escapeHtml(part.text || "")}</pre>
             ${imageHtml}
           </div>`;
@@ -365,6 +370,7 @@ function groupMessagesForDisplay(messages) {
     if (shouldMergeMessages(previousGroup, message)) {
       previousGroup.parts.push({
         id: message.id || "",
+        threadId: message.threadId || "",
         timestamp: message.timestamp || "",
         text: message.text || "",
         images: message.images || []
@@ -379,10 +385,12 @@ function groupMessagesForDisplay(messages) {
 
     groups.push({
       author: message.author || "Unknown",
+      threadId: message.threadId || "",
       timestamp: message.timestamp || "",
       parts: [
         {
           id: message.id || "",
+          threadId: message.threadId || "",
           timestamp: message.timestamp || "",
           text: message.text || "",
           images: message.images || []
@@ -396,6 +404,10 @@ function groupMessagesForDisplay(messages) {
 
 function shouldMergeMessages(previousGroup, message) {
   if (!previousGroup || !message) {
+    return false;
+  }
+
+  if ((previousGroup.threadId || "") !== (message.threadId || "")) {
     return false;
   }
 

@@ -1,6 +1,6 @@
 # Teams Chat Archiver
 
-Teams Chat Archiver is a Chrome extension for saving a local copy of conversations from Microsoft Teams on the web. It can archive the chat you currently have open, chats in selected sidebar groups, or all chats visible in your Teams chat list.
+Teams Chat Archiver is a Chrome extension for saving a local copy of conversations from Microsoft Teams on the web. It can archive the chat or channel you currently have open, conversations in selected sidebar groups, or all conversations visible in your Teams chat list.
 
 Use it when you want to keep an accessible, long-term record of important conversations outside the Teams interface. The extension copies messages and, optionally, pasted images into a folder you choose. It does not remove or change anything in Teams.
 
@@ -18,7 +18,8 @@ The browsing webpage uses files stored inside the archive folder. It does not re
 ## Main features
 
 - Archives the currently open chat or all chats visible in the Teams chat list
-- Archives selected sidebar groups, including Favorites and custom groups, with muted chats included
+- Archives selected sidebar groups, including Favorites and custom groups, with muted chats and channels included
+- Captures channel posts and replies with thread references, post subjects, link URLs, and optional inline images
 - Works with Teams at `https://teams.cloud.microsoft/`
 - Scrolls through each chat to collect older messages that are available in the Teams page
 - Keeps a new snapshot from every archive run and combines snapshots into the latest record
@@ -32,7 +33,15 @@ The browsing webpage uses files stored inside the archive folder. It does not re
 3. Check one or more groups, such as Favorites, CAT, or other.
 4. Click **Archive Groups** and choose your archive folder.
 
-The extension expands selected groups, follows their **See more** controls, and scrolls the sidebar to collect chat rows. Selected groups can remain expanded after the run. Chats appearing in multiple selected groups are collected once by chat ID. Channels inside a group are not included.
+The extension expands selected groups, follows their **See more** controls, and scrolls the sidebar to collect chat and channel rows. Selected groups can remain expanded after the run. Conversations appearing in multiple selected groups are collected once by their Teams ID.
+
+**Archive All Chats** excludes the built-in **Teams and channels** section. Channels placed in Favorites or custom groups, such as other, are still included. **Archive Current Chat** can still archive a channel you explicitly open from the built-in section.
+
+For channels, it expands truncated messages and opens reply summaries when not all replies are shown. It scans channel history in both directions and preserves each message's thread-root ID in JSON and post/reply references in the transcript. If a message or reply thread cannot be fully loaded, or channel history reaches its safety limit, the extension reports an error instead of saving a known partial channel snapshot. A batch run can still contain successfully saved conversations from before that error.
+
+Channel panes that are still loading are allowed to settle before a non-scrolling result is accepted. Threads temporarily removed from the page by Teams virtualization are deferred to the history scan, with a final reply-count check before saving.
+
+Opened reply threads are scanned in both directions. Deleted replies exposed by Teams are included as stable-ID deletion markers and count toward the advertised reply total; the extension cannot recover deleted content that was never archived. Reply-loading errors include the collected and expected counts to help diagnose unsupported layouts.
 
 If Teams stops loading a group or the safety limit is reached, the selected-group run stops before archiving any chats rather than using a known partial list. Changing the active Teams tab after loading the group picker requires reloading the group list. Existing same-day archive skipping still applies, and the archive folder structure does not change.
 
@@ -72,10 +81,14 @@ YourArchiveFolder/
 
 Each run adds a dated file under `snapshots/`. The extension combines those snapshots into `latest.json` and rebuilds the HTML browsing pages. Duplicate messages are removed during this process. Images are stored separately and linked from the transcript pages so the same image does not need to be saved repeatedly.
 
+When a channel reply appears first as a preview and later with fuller content, the merged record keeps the longer text, available author and timestamp, and collected images. Later previews do not replace that fuller text or erase its metadata; this also applies when rebuilding from older snapshots.
+
 ## Current limitations
 
-- Batch mode only archives chats that are currently visible in the Teams chat list
-- Selected-group mode attempts to load all chats in the chosen groups, but depends on Teams exposing its group, pagination, and scrolling controls correctly
+- Batch mode only archives chats and channels that are currently visible in the Teams chat list
+- Selected-group mode attempts to load all chats and channels in the chosen groups, but depends on Teams exposing its group, pagination, and scrolling controls correctly
+- Channel loading depends on Teams exposing reply counts and expansion controls; permission-restricted or unsupported thread views may fail rather than produce a partial snapshot
+- Channel support is regression-tested with synthetic markup and extraction from a saved Teams page; live Teams navigation and full-history loading still need validation
 - Teams changes its HTML structure often, so selectors may need adjustment over time
 - Snapshot merging deduplicates by message id when present, otherwise by author + timestamp + text + image source
 - Only pasted inline images are currently archived
@@ -103,4 +116,4 @@ While the tool is running, avoid interacting with the Teams tab. You can switch 
 
 ## Development checks
 
-Serve the repository root with a local static HTTP server, then open `/tests/group-archive.html` in a browser. The dependency-free regression page tests the actual content and popup scripts against synthetic Teams markup and mocked extension APIs. It covers group boundaries, muted chats, deduplication, expansion, pagination, virtualized rows, error handling, and popup routing. It does not access Teams or write archives.
+Serve the repository root with a local static HTTP server, then open `/tests/group-archive.html` in a browser. The dependency-free regression page tests the actual content, popup, and background scripts against synthetic Teams markup and mocked extension APIs. It covers group boundaries, muted chats, channels, deduplication, expansion, pagination, virtualized rows, channel metadata and thread navigation, bidirectional channel history, error handling, transcript output, and popup routing. It does not access Teams or write archives.
