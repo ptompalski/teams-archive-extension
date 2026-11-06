@@ -62,7 +62,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function archiveCurrentChat(chatLabelOverride = "") {
   const chatTitle = normalizeChatTitle(getChatTitle(chatLabelOverride));
   const chatOrder = getCurrentChatListOrder(chatTitle);
-  const collectedMessages = collectMessages();
+  const collectedMessages = [];
   await loadOlderMessages(collectedMessages);
   const messages = dedupeMessageRecords([
     ...collectedMessages,
@@ -93,7 +93,7 @@ function listVisibleChats() {
   const chats = [];
 
   for (const item of chatItems) {
-    if (!looksLikeChatListEntry(item)) {
+    if (!looksLikeChatListEntry(item) || item.closest("[data-item-type='teams-and-channels']")) {
       continue;
     }
 
@@ -145,13 +145,13 @@ function findChatGroup(groupId) {
 }
 
 function getChatListEntryId(entry) {
-  const title = entry.querySelector("[id^='title-chat-list-item_']");
-  return title?.id.slice("title-chat-list-item_".length) || "";
+  const title = entry.querySelector("[id^='title-chat-list-item_'], [id^='title-channel-list-item-']");
+  return title?.id.replace(/^title-(?:chat-list-item_|channel-list-item-)/, "") || "";
 }
 
 function getChatsInGroup(group) {
   const entries = Array.from(group.querySelectorAll(
-    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'], [data-item-type='channel'])"
   )).filter((entry) => entry.closest("[data-conversation-folder='true']") === group);
 
   return entries.map((entry, order) => ({
@@ -247,7 +247,7 @@ async function scanChatGroup(groupId, targetChatId = "") {
 
       if (targetChatId) {
         const entry = Array.from(group.querySelectorAll(
-          "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
+          "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'], [data-item-type='channel'])"
         )).find((item) => getChatListEntryId(item) === targetChatId);
 
         if (entry) {
@@ -374,9 +374,35 @@ async function openChatByLabel(chatLabel, { chatId = "", groupId = "" } = {}) {
 }
 
 async function loadOlderMessages(collectedMessages = []) {
-  const scrollContainer = getMessageScrollContainer();
+  let isChannel = Boolean(getChatRoot().querySelector("[data-tid='channel-pane-message']"));
+  const replyCounts = new Map();
+  await expandChannelMessages(collectedMessages, replyCounts);
+  let scrollContainer = getMessageScrollContainer();
+
+  if (!scrollContainer && (isChannel || isMessagePaneBusy())) {
+    let stableRounds = 0;
+
+    for (let round = 0; round < 200 && !scrollContainer; round += 1) {
+      const previousCount = collectedMessages.length;
+      await wait(900);
+      await expandChannelMessages(collectedMessages, replyCounts);
+      scrollContainer = getMessageScrollContainer();
+      isChannel = isChannel || Boolean(getChatRoot().querySelector("[data-tid='channel-pane-message']"));
+      stableRounds = !isMessagePaneBusy() && collectedMessages.length === previousCount ? stableRounds + 1 : 0;
+
+      if (stableRounds >= 3) {
+        break;
+      }
+    }
+
+    if (!scrollContainer && stableRounds < 3) {
+      throw new Error("Channel history reached its safety limit. No partial channel snapshot was saved.");
+    }
+  }
 
   if (!scrollContainer) {
+    appendUniqueMessages(collectedMessages, collectMessages());
+    assertChannelRepliesComplete(collectedMessages, replyCounts);
     return;
   }
 
@@ -387,18 +413,23 @@ async function loadOlderMessages(collectedMessages = []) {
   const maxRounds = 80;
 
   for (let round = 0; round < maxRounds; round += 1) {
+    scrollContainer = getMessageScrollContainer() || scrollContainer;
     notifyProgress(`Loading older messages (${round + 1}/${maxRounds})...`);
     appendUniqueMessages(collectedMessages, collectMessages());
 
     if (scrollContainer.scrollTop <= 0) {
       scrollContainer.scrollTop = 0;
     } else {
-      const nextTop = Math.max(0, scrollContainer.scrollTop - Math.max(600, scrollContainer.clientHeight));
+      const step = isChannel ? Math.max(100, scrollContainer.clientHeight * 0.8)
+        : Math.max(600, scrollContainer.clientHeight);
+      const nextTop = Math.max(0, scrollContainer.scrollTop - step);
       scrollContainer.scrollTop = nextTop;
     }
 
     dispatchScrollEvents(scrollContainer);
     await wait(900);
+    await expandChannelMessages(collectedMessages, replyCounts);
+    scrollContainer = getMessageScrollContainer() || scrollContainer;
 
     const currentMessageCount = collectMessages().length;
     const currentScrollTop = scrollContainer.scrollTop;
@@ -407,7 +438,9 @@ async function loadOlderMessages(collectedMessages = []) {
     const noGrowth = currentScrollHeight === previousScrollHeight;
     const noNewMessages = currentMessageCount === previousMessageCount;
 
-    if ((currentScrollTop <= 0 && noNewMessages) || (noScrollMovement && noGrowth && noNewMessages)) {
+    const busy = isChannel && isMessagePaneBusy();
+
+    if (!busy && ((currentScrollTop <= 0 && noNewMessages) || (noScrollMovement && noGrowth && noNewMessages))) {
       stableRounds += 1;
     } else {
       stableRounds = 0;
@@ -422,8 +455,202 @@ async function loadOlderMessages(collectedMessages = []) {
     }
   }
 
+  if (isChannel) {
+    if (stableRounds < 3) {
+      throw new Error("Channel history reached its safety limit. No partial channel snapshot was saved.");
+    }
+
+    await loadChannelHistoryDown(collectedMessages, replyCounts);
+  }
+
   appendUniqueMessages(collectedMessages, collectMessages());
+  assertChannelRepliesComplete(collectedMessages, replyCounts);
   notifyProgress("Finished loading older messages.");
+}
+
+async function loadChannelHistoryDown(collectedMessages, replyCounts) {
+  let stableRounds = 0;
+
+  for (let round = 0; round < 200; round += 1) {
+    notifyProgress(`Reading channel history (${round + 1}/200)...`);
+    const previousCount = collectedMessages.length;
+    let scrollable = getMessageScrollContainer();
+
+    if (scrollable) {
+      scrollable.scrollTop += Math.max(100, scrollable.clientHeight * 0.8);
+      dispatchScrollEvents(scrollable);
+      await wait(900);
+    }
+
+    await expandChannelMessages(collectedMessages, replyCounts);
+    scrollable = getMessageScrollContainer();
+    const atBottom = !scrollable ||
+      scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 2;
+    const busy = isMessagePaneBusy();
+
+    if (atBottom && !busy && collectedMessages.length === previousCount) {
+      stableRounds += 1;
+
+      if (stableRounds >= 3) {
+        return;
+      }
+    } else {
+      stableRounds = 0;
+    }
+
+    if (!scrollable) {
+      await wait(900);
+    }
+  }
+
+  throw new Error("Channel history reached its safety limit. No partial channel snapshot was saved.");
+}
+
+function isMessagePaneBusy() {
+  const root = getChatRoot();
+  const selector = "[aria-busy='true'], [role='progressbar']";
+  return root.matches(selector) || Boolean(root.querySelector(selector));
+}
+
+async function expandChannelBodies() {
+  for (let round = 0; round < 200; round += 1) {
+    const control = Array.from(getChatRoot().querySelectorAll(
+      "[aria-controls^='see-more-content-'][aria-expanded='false']"
+    )).find((button) => document.getElementById(button.getAttribute("aria-controls"))
+      ?.querySelector("[data-tid='message-body']"));
+
+    if (!control) {
+      return;
+    }
+
+    clickElement(control);
+
+    for (let attempt = 0; attempt < 20 && control.isConnected &&
+        control.getAttribute("aria-expanded") === "false"; attempt += 1) {
+      await wait(200);
+    }
+
+    if (control.isConnected && control.getAttribute("aria-expanded") === "false") {
+      throw new Error("Teams did not expand a channel message. No partial channel snapshot was saved.");
+    }
+  }
+
+  throw new Error("Channel message expansion reached its safety limit. No partial channel snapshot was saved.");
+}
+
+async function expandChannelMessages(collectedMessages, replyCounts) {
+  await expandChannelBodies();
+  appendUniqueMessages(collectedMessages, collectMessages());
+  const channelLabel = getChatTitle();
+  const threads = Array.from(getChatRoot().querySelectorAll("[data-tid='response-summary-button']"))
+    .map((summary) => {
+      const elementId = summary.closest("[data-tid='channel-pane-message']")?.id;
+      const threadId = elementId?.replace(/^reply-chain-summary-/, "");
+      const surface = summary.closest("[data-tid='response-surface']");
+      const countText = `${surface?.getAttribute("aria-label") || ""} ${summary.textContent || ""}`;
+      const expected = Number(countText.match(/(\d+)\s+repl(?:y|ies)/i)?.[1]);
+
+      if (!threadId || !Number.isFinite(expected)) {
+        throw new Error("Could not determine a channel thread's reply count. No partial channel snapshot was saved.");
+      }
+
+      replyCounts.set(threadId, expected);
+      return { elementId, threadId, expected };
+    });
+
+  for (const { elementId, threadId, expected } of threads) {
+    const thread = document.getElementById(elementId);
+    const summary = thread?.querySelector("[data-tid='response-summary-button']");
+
+    if (!summary || !getChatRoot().contains(thread)) {
+      continue;
+    }
+
+    const readReplies = () => collectMessages(threadId)
+      .filter((message) => message.threadId === threadId && message.id !== threadId);
+
+    if (new Set(collectedMessages.filter((message) => message.threadId === threadId &&
+      message.id !== threadId).map((message) => message.id)).size >= expected) {
+      continue;
+    }
+
+    notifyProgress(`Loading ${expected} replies in a channel thread...`);
+    summary.scrollIntoView({ block: "nearest" });
+    clickElement(summary);
+    let complete = false;
+    let scrollDirection = -1;
+    let boundaryRounds = 0;
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      await wait(300);
+      await expandChannelBodies();
+      const replies = readReplies();
+      appendUniqueMessages(collectedMessages, replies);
+
+      if (new Set(collectedMessages.filter((message) => message.threadId === threadId &&
+          message.id !== threadId).map((message) => message.id)).size >= expected) {
+        complete = true;
+        break;
+      }
+
+      const currentThread = document.getElementById(`reply-chain-summary-${threadId}`);
+      const replyRoot = document.querySelector("[data-tid='channel-replies-runway']") ||
+        currentThread?.querySelector("[data-tid='response-surface']") || getChatRoot();
+      const scrollable = findScrollableDescendant(replyRoot) || findScrollableAncestor(replyRoot);
+
+      if (scrollable) {
+        const atBoundary = scrollDirection < 0 ? scrollable.scrollTop <= 0
+          : scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 2;
+        boundaryRounds = atBoundary && !isMessagePaneBusy() ? boundaryRounds + 1 : 0;
+
+        if (boundaryRounds >= 3) {
+          scrollDirection *= -1;
+          boundaryRounds = 0;
+        }
+
+        scrollable.scrollTop = Math.max(0, scrollable.scrollTop +
+          scrollDirection * Math.max(100, scrollable.clientHeight * 0.8));
+        dispatchScrollEvents(scrollable);
+      }
+    }
+
+    if (!complete) {
+      const collectedCount = new Set(collectedMessages.filter((message) => message.threadId === threadId &&
+        message.id !== threadId).map((message) => message.id)).size;
+      throw new Error(`Teams stopped loading channel replies (${collectedCount}/${expected} collected for post ${threadId}). No partial channel snapshot was saved.`);
+    }
+
+    if (!thread.isConnected || !getChatRoot().contains(thread)) {
+      const entry = findChatListEntry(channelLabel);
+
+      if (!entry) {
+        throw new Error("Could not return to the channel after reading replies.");
+      }
+
+      clickElement(entry);
+      await wait(300);
+
+      for (let attempt = 0; attempt < 30 &&
+          !getChatRoot().querySelector("[data-tid='channel-pane-message']"); attempt += 1) {
+        await wait(300);
+      }
+
+      if (!getChatRoot().querySelector("[data-tid='channel-pane-message']")) {
+        throw new Error("Teams did not return to the channel after reading replies.");
+      }
+    }
+  }
+}
+
+function assertChannelRepliesComplete(collectedMessages, replyCounts) {
+  for (const [threadId, expected] of replyCounts) {
+    const count = new Set(collectedMessages.filter((message) => message.threadId === threadId &&
+      message.id !== threadId).map((message) => message.id)).size;
+
+    if (count < expected) {
+      throw new Error("A channel thread could not be rediscovered with all its replies. No partial channel snapshot was saved.");
+    }
+  }
 }
 
 function getChatTitle(chatLabelOverride = "") {
@@ -483,9 +710,8 @@ function normalizeChatTitle(value) {
 
 function getCurrentChatListLabel() {
   const selectedSelectors = [
-    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-selected='true']",
-    "[role='treeitem'][data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-selected='true']",
-    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])[aria-current='true']"
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'], [data-item-type='channel'])[aria-selected='true']",
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'], [data-item-type='channel'])[aria-current='true']"
   ];
 
   for (const selector of selectedSelectors) {
@@ -541,7 +767,7 @@ function looksLikeChatListEntry(element) {
 
   if (
     element.matches(
-      "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
+      "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'], [data-item-type='channel'])"
     )
   ) {
     return true;
@@ -573,7 +799,7 @@ function looksLikeChatListEntry(element) {
 }
 
 function getChatListEntryLabel(element) {
-  const titleElement = element.querySelector("[id^='title-chat-list-item_']");
+  const titleElement = element.querySelector("[id^='title-chat-list-item_'], [id^='title-channel-list-item-']");
 
   if (titleElement?.textContent?.trim()) {
     return cleanChatListLabel(titleElement.textContent);
@@ -660,9 +886,8 @@ function findChatListEntry(chatLabel) {
 
 function getChatListEntries() {
   const selectors = [
-    "[role='treeitem'][data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])",
-    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'])",
-    "[data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'])"
+    "[role='treeitem']:is([data-item-type='chat'], [data-item-type='muted-chat'], [data-item-type='channel'])",
+    "[data-testid='list-item']:is([data-item-type='chat'], [data-item-type='muted-chat'], [data-item-type='channel'])"
   ];
 
   const entries = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
@@ -809,8 +1034,17 @@ function cleanPageTitle(value) {
     .trim();
 }
 
-function collectMessages() {
+function collectMessages(channelThreadId = "") {
   const chatRoot = getChatRoot();
+  const channelBodies = Array.from(chatRoot.querySelectorAll(
+    "[data-tid='message-body'][id^='content-'], :is([data-tid='channel-pane-message'], [data-tid='channel-replies-pane-message']) [data-tid='message-tombstone'][id^='tombstone-']"
+  ));
+
+  if (channelBodies.length) {
+    return dedupeMessageRecords(channelBodies.map((body) =>
+      extractChannelMessageRecord(body, channelThreadId)).filter(Boolean));
+  }
+
   const textBodyNodes = Array.from(
     chatRoot.querySelectorAll(
       [
@@ -836,6 +1070,11 @@ function collectMessages() {
       continue;
     }
 
+    if (channelThreadId) {
+      record.threadId = channelThreadId;
+      record.id = record.id.replace(/^(?:message-body-|message-)/, "");
+    }
+
     if (record.author && record.author !== "Unknown") {
       lastKnownAuthor = record.author;
     }
@@ -853,6 +1092,45 @@ function collectMessages() {
   return messages;
 }
 
+function extractChannelMessageRecord(bodyNode, channelThreadId = "") {
+  const container = bodyNode.closest("[id^='message-body-']") || bodyNode;
+  const metadata = container.closest("[id^='post-message-renderer-']") || container;
+  const thread = bodyNode.closest("[data-tid='channel-pane-message']");
+  const replyPost = bodyNode.closest("[data-tid='channel-replies-runway']")
+    ?.querySelector("[id^='post-message-renderer-'] [data-tid='message-body']");
+  const images = collectInlineImages(bodyNode);
+  let text = normalizeText(bodyNode.innerText || bodyNode.textContent || "");
+  const subject = findNestedText(metadata, ["[data-tid='subject-line']"]);
+
+  if (subject && !text.startsWith(subject)) {
+    text = `${subject}\n\n${text}`;
+  }
+
+  const links = Array.from(bodyNode.querySelectorAll("a[href]"))
+    .map((link) => link.getAttribute("href") || "")
+    .filter((href) => /^https?:\/\//i.test(href) && !text.includes(href));
+
+  if (links.length) {
+    text += `${text ? "\n\n" : ""}Links:\n${Array.from(new Set(links)).join("\n")}`;
+  }
+
+  if ((!text && !images.length) || isInsideIgnoredRegion(bodyNode)) {
+    return null;
+  }
+
+  const id = bodyNode.id.replace(/^(?:content-|tombstone-)/, "");
+  return {
+    id,
+    threadId: thread?.id.replace(/^reply-chain-summary-/, "") || channelThreadId ||
+      replyPost?.id.replace(/^content-/, "") || id,
+    ...(bodyNode.matches("[data-tid='message-tombstone']") ? { deleted: true } : {}),
+    author: findNestedText(metadata, ["[id^='author-']"]) || "Unknown",
+    timestamp: findTimeText(metadata),
+    text,
+    images
+  };
+}
+
 function appendUniqueMessages(targetMessages, sourceMessages) {
   const merged = dedupeMessageRecords([...(targetMessages || []), ...(sourceMessages || [])]);
   targetMessages.length = 0;
@@ -860,18 +1138,37 @@ function appendUniqueMessages(targetMessages, sourceMessages) {
 }
 
 function dedupeMessageRecords(messages) {
-  const seen = new Set();
+  const byKey = new Map();
   const deduped = [];
 
   for (const message of messages) {
     const key = buildMessageRecordKey(message);
 
-    if (!key || seen.has(key)) {
+    if (!key) {
       continue;
     }
 
-    seen.add(key);
-    deduped.push(message);
+    const previous = byKey.get(key);
+
+    if (previous) {
+      if (previous.threadId || message.threadId) {
+        previous.threadId = message.threadId || previous.threadId;
+        if (message.deleted) {
+          previous.deleted = true;
+        }
+        previous.text = (message.text || "").length >= (previous.text || "").length
+          ? message.text : previous.text;
+        previous.author = message.author && message.author !== "Unknown" ? message.author : previous.author;
+        previous.timestamp = message.timestamp || previous.timestamp;
+        previous.images = Array.from(new Map([...(previous.images || []), ...(message.images || [])]
+          .map((image) => [image.sourceUrl || image.localPath || image.embeddedDataUrl, image])).values());
+      }
+      continue;
+    }
+
+    const record = { ...message };
+    byKey.set(key, record);
+    deduped.push(record);
   }
 
   return deduped;
@@ -901,6 +1198,7 @@ function buildMessageRecordKey(message) {
 
 function getChatRoot() {
   const rootSelectors = [
+    "[data-tid='channel-replies-runway']",
     "[data-tid='message-pane-list-runway']",
     "[data-tid='chat-pane-content']",
     "[data-tid='message-pane-body']",
@@ -920,6 +1218,7 @@ function getChatRoot() {
 
 function getMessageScrollContainer() {
   const rootSelectors = [
+    "[data-tid='channel-replies-runway']",
     "[data-tid='message-pane-list-runway']",
     "[data-tid='chat-pane-content']",
     "[data-tid='message-pane-body']"

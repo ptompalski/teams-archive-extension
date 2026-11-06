@@ -9,6 +9,7 @@
       const results = document.getElementById("results");
       const contentSource = await (await fetch("../content.js")).text();
       const popupSource = await (await fetch("../popup.js")).text();
+      const backgroundSource = await (await fetch("../background.js")).text();
       const popupMarkup = await (await fetch("../popup.html")).text();
       const failures = [];
       let passed = 0;
@@ -17,14 +18,14 @@
       };
       const parse = (markup) => new DOMParser().parseFromString(markup, "text/html");
       const chat = (id, label, type = "chat") =>
-        `<div role="treeitem" data-item-type="${type}"><span id="title-chat-list-item_${id}">${label}</span></div>`;
+        `<div role="treeitem" data-item-type="${type}"><span id="${type === "channel" ? "title-channel-list-item-" : "title-chat-list-item_"}${id}">${label}</span></div>`;
       const folder = (id, label, children = "", expanded = true, type = "custom-folder") =>
         `<div role="treeitem" data-conversation-folder="true" data-item-type="${type}" aria-expanded="${expanded}"><div id="${id}" data-testid="conversation-folder-header"><div class="fui-TreeItemLayout__main">${label}</div></div><div role="group">${children}</div></div>`;
       const loadContent = (fixture, tick = async () => {}) => new Function(
         "document", "window", "chrome", "testWait", contentSource +
-        "\nwait = testWait; return {listChatGroups, getChatsInGroup, findChatGroup, listSelectedGroupChats, scanChatGroup, listVisibleChats};"
+        "\nwait = testWait; return {listChatGroups, getChatsInGroup, findChatGroup, listSelectedGroupChats, scanChatGroup, listVisibleChats, collectMessages, loadOlderMessages, appendUniqueMessages};"
       )(fixture, {
-        getComputedStyle: (element) => ({ overflowY: element.id === "rail" ? "auto" : "visible" }),
+        getComputedStyle: (element) => ({ overflowY: element.id === "rail" ? "auto" : "visible", overflowX: "visible" }),
         dispatchEvent() {}
       }, { runtime: { onMessage: { addListener() {} }, sendMessage() {} } }, tick);
       const test = async (name, check) => {
@@ -50,15 +51,22 @@
           folder("favorites", "Favourites", chat("shared", "Shared conversation")) +
           folder("cat", "CAT", chat("cat-only", "CAT chat") + chat("shared", "Shared conversation")) +
           folder("other", "other", chat("muted", "Muted chat", "muted-chat") + chat("channel", "Channel", "channel")) +
+          folder("teams", "Teams and channels", '<div role="treeitem" data-item-type="team">' +
+            chat("channel", "Channel", "channel") + chat("library-only", "Library-only channel", "channel") +
+            '</div>', true, "teams-and-channels") +
           folder("quick", "Quick views", "", true, "quick-views")
         );
         const api = loadContent(fixture);
         assert(api.listChatGroups().map(group => group.label).join() === "Favourites,CAT,other", "Wrong groups");
         const selected = await api.listSelectedGroupChats(["cat", "other", "cat"]);
-        assert(selected.map(entry => entry.id).join() === "cat-only,shared,muted", "Wrong selection or order");
+        assert(selected.map(entry => entry.id).join() === "cat-only,shared,muted,channel", "Wrong selection or order");
         const all = await api.listSelectedGroupChats(["favorites", "cat", "other"]);
-        assert(all.length === 3 && all.every((entry, order) => entry.order === order), "Deduplication failed");
-        assert(api.listVisibleChats().length === 3, "Visible chat behavior regressed");
+        assert(all.length === 4 && all.every((entry, order) => entry.order === order), "Deduplication failed");
+        assert(api.listVisibleChats().length === 4, "Visible chat behavior regressed");
+        assert(!api.listVisibleChats().some(entry => entry.label === "Library-only channel"), "Archive All Chats included the built-in Teams and channels section");
+        assert(api.listVisibleChats().some(entry => entry.label === "Channel"), "Channel in a custom group was excluded");
+        const opened = await api.scanChatGroup("other", "channel");
+        assert(opened.entry.querySelector("span").textContent === "Channel", "Channel identity was not reopened");
       });
 
       await test("Collapsed groups expand before collection", async () => {
@@ -69,6 +77,23 @@
           group.querySelector("[role='group']").innerHTML = chat("hidden", "Hidden chat");
         });
         assert((await loadContent(fixture).listSelectedGroupChats(["cat"]))[0].id === "hidden", "Hidden chat missed");
+      });
+
+      await test("Channel posts and replies retain separate identities, metadata, links and inline images", async () => {
+        const fixture = parse(`<main><div data-tid="channel-pane-message" id="reply-chain-summary-100">
+          <div id="post-message-renderer-100"><span id="author-100">Post author</span><time datetime="2026-10-01T12:00:00Z"></time>
+            <div id="message-body-100"><div data-tid="message-body" id="content-100">Post <a href="https://example.com/resource">resource</a></div></div></div>
+          <div id="message-body-101"><div data-tid="reply-message-header"><span id="author-101">Reply author</span><time datetime="2026-10-02T12:00:00Z"></time></div>
+            <div data-tid="message-body" id="content-101">Reply<img src="https://example.com/image.png" width="200" height="100"></div></div>
+          <div id="message-body-102"><span id="author-102">Another author</span><time datetime="2026-10-03T12:00:00Z"></time>
+            <div data-tid="message-body" id="content-102">Copilot</div></div>
+        </div></main>`);
+        const messages = loadContent(fixture).collectMessages();
+        assert(messages.map(message => message.id).join() === "100,101,102", "Messages collapsed or ignored");
+        assert(messages.every(message => message.threadId === "100"), "Reply thread lost");
+        assert(messages[1].author === "Reply author" && messages[1].timestamp === "2026-10-02T12:00:00Z", "Reply inherited post metadata");
+        assert(messages[0].text.includes("https://example.com/resource"), "Link URL lost");
+        assert(messages[1].images.length === 1, "Reply image missed");
       });
 
       await test("Pagination loads successive pages including channel-only pages", async () => {
@@ -84,8 +109,61 @@
           if (pages === 2) more.remove();
         });
         const selected = await loadContent(fixture).listSelectedGroupChats(["cat"]);
-        assert(pages === 2 && selected.length === 1 && selected[0].id === "last", "Pagination incomplete");
+        assert(pages === 2 && selected.map(entry => entry.id).join() === "channel-one,channel-two,last", "Pagination incomplete");
         assert(group.querySelectorAll("[data-item-type='channel']").length === 2, "Fixture pagination failed");
+      });
+
+      await test("Channel loading expands truncated bodies and missing replies before capture", async () => {
+        const fixture = parse(`<main><div data-tid="channel-pane-message" id="reply-chain-summary-100">
+          <div id="post-message-renderer-100"><span id="author-100">Author</span><div data-tid="subject-line">Subject</div>
+            <div id="message-body-100"><div id="see-more-content-100"><div data-tid="message-body" id="content-100">Short</div></div>
+              <button aria-controls="see-more-content-100" aria-expanded="false">see more</button></div></div>
+          <div data-tid="response-surface" aria-label="2 replies"><button data-tid="response-summary-button">Open 2 replies</button></div>
+        </div></main>`);
+        fixture.querySelector("[aria-controls]").addEventListener("click", (event) => {
+          fixture.getElementById("content-100").textContent = "Full post content";
+          event.currentTarget.setAttribute("aria-expanded", "true");
+        });
+        fixture.querySelector("[data-tid='response-summary-button']").addEventListener("click", (event) => {
+          event.currentTarget.insertAdjacentHTML("afterend", [101, 102].map(id =>
+            `<div id="message-body-${id}"><span id="author-${id}">Reply author</span><div data-tid="message-body" id="content-${id}">Reply ${id}</div></div>`).join(""));
+        });
+        const collected = [];
+        await loadContent(fixture).loadOlderMessages(collected);
+        assert(collected.length === 3, "Expanded replies missed");
+        assert(collected.find(message => message.id === "100").text === "Subject\n\nFull post content", "Truncated version or missing subject saved");
+        assert(collected.every(message => message.threadId === "100"), "Expanded thread identity lost");
+      });
+
+      await test("Stalled channel reply and body expansion reject rather than saving a partial snapshot", async () => {
+        const fixture = parse(`<main><div data-tid="channel-pane-message" id="reply-chain-summary-100">
+          <div data-tid="message-body" id="content-100">Post</div>
+          <div data-tid="response-surface" aria-label="5 replies"><button data-tid="response-summary-button">Open 5 replies</button></div>
+        </div></main>`);
+        await rejects(() => loadContent(fixture).loadOlderMessages([]), /stopped loading channel replies/);
+        fixture.querySelector("[data-tid='response-surface']").remove();
+        fixture.querySelector("main").insertAdjacentHTML("beforeend", '<div id="see-more-content-100"><div data-tid="message-body" id="content-200">Short</div></div><button aria-controls="see-more-content-100" aria-expanded="false">see more</button>');
+        await rejects(() => loadContent(fixture).loadOlderMessages([]), /did not expand/);
+      });
+
+      await test("Full channel replies replace previews without being downgraded on a later feed read", async () => {
+        const fixture = parse(`<main><div data-tid="channel-pane-message" id="reply-chain-summary-100">
+          <div data-tid="message-body" id="content-100">Post</div>
+          <div data-tid="response-surface" aria-label="2 replies"><button data-tid="response-summary-button">Open 2 replies</button>
+            <div id="message-body-101"><div data-tid="message-body" id="content-101">Preview</div></div>
+          </div></div></main>`);
+        fixture.querySelector("button").addEventListener("click", () => {
+          fixture.getElementById("message-body-101").innerHTML = '<span id="author-101">Actual reply author</span><time datetime="2026-10-02T12:00:00Z"></time><div data-tid="message-body" id="content-101">Complete reply text</div>';
+          fixture.querySelector("[data-tid='response-surface']").insertAdjacentHTML("beforeend", '<div id="message-body-102"><div data-tid="message-body" id="content-102">Second reply</div></div>');
+        });
+        const api = loadContent(fixture);
+        const collected = [];
+        await api.loadOlderMessages(collected);
+        api.appendUniqueMessages(collected, [{ id: "101", threadId: "100", author: "Unknown", timestamp: "", text: "Preview", images: [] }]);
+        const reply = collected.find(message => message.id === "101");
+        assert(reply.text === "Complete reply text", "Reply text remained a preview or was downgraded");
+        assert(reply.author === "Actual reply author" && reply.timestamp === "2026-10-02T12:00:00Z", "Full reply metadata was discarded");
+        assert(collected.length === 3, "Reply identity duplicated");
       });
 
       await test("Virtualized rows accumulate and can be reopened by chat ID", async () => {
@@ -105,6 +183,201 @@
         assert(position === 0, "List scroll was not restored");
         const opened = await api.scanChatGroup("cat", "chat-2");
         assert(opened.entry.querySelector("span").id === "title-chat-list-item_chat-2", "Wrong identity reopened");
+      });
+
+      await test("Channel thread navigation returns to the feed without losing posts", async () => {
+        const fixture = parse(folder("other", "other", chat("channel", "Channel", "channel")) + '<main></main>');
+        fixture.title = "Channel";
+        const main = fixture.querySelector("main");
+        const feed = () => {
+          main.innerHTML = `<div data-tid="channel-pane-message" id="reply-chain-summary-100"><div data-tid="message-body" id="content-100">Post</div>
+            <div data-tid="response-surface" aria-label="2 replies"><button data-tid="response-summary-button">Open 2 replies</button></div></div>`;
+          main.querySelector("button").addEventListener("click", () => {
+            main.innerHTML = [101, 102].map(id => `<div id="message-body-${id}"><span id="author-${id}">Author</span><div data-tid="message-body" id="content-${id}">Reply</div></div>`).join("");
+          });
+        };
+        fixture.querySelector("[data-item-type='channel']").addEventListener("click", feed);
+        feed();
+        const collected = [];
+        await loadContent(fixture).loadOlderMessages(collected);
+        assert(collected.map(message => message.id).sort().join() === "100,101,102", "Navigation lost messages");
+        assert(collected.every(message => message.threadId === "100"), "Detached replies lost thread IDs");
+        assert(main.querySelector("[data-tid='channel-pane-message']"), "Feed was not restored");
+      });
+
+      await test("Channel history scans virtualized posts above and below the initial position", async () => {
+        const fixture = parse('<main><div id="rail" data-tid="message-pane-body"></div></main>');
+        const rail = fixture.getElementById("rail");
+        let position = 200;
+        const render = () => {
+          const id = 1000 + Math.floor(position / 100);
+          rail.innerHTML = `<div data-tid="channel-pane-message" id="reply-chain-summary-${id}"><div data-tid="message-body" id="content-${id}">Post ${id}</div></div>`;
+        };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 100 }, scrollHeight: { value: 400 },
+          scrollTop: { get: () => position, set: value => { position = Math.max(0, Math.min(300, value)); render(); } }
+        });
+        render();
+        const collected = [];
+        await loadContent(fixture).loadOlderMessages(collected);
+        assert(collected.map(message => message.id).sort().join() === "1000,1001,1002,1003", "Channel history was only scanned in one direction");
+      });
+
+      await test("Channel replies are swept downward when the opened thread starts at the top", async () => {
+        const fixture = parse(folder("other", "other", chat("channel", "Channel", "channel")) + '<main><div id="rail" data-tid="message-pane-body"></div></main>');
+        fixture.title = "Channel";
+        const rail = fixture.getElementById("rail");
+        let opened = false;
+        let position = 0;
+        const feed = () => {
+          opened = false;
+          rail.innerHTML = '<div data-tid="channel-pane-message" id="reply-chain-summary-100"><div data-tid="message-body" id="content-100">Post</div><div data-tid="response-surface" aria-label="3 replies"><button data-tid="response-summary-button">Open 3 replies</button></div></div>';
+          rail.querySelector("button").addEventListener("click", () => { opened = true; position = 0; render(); });
+        };
+        const render = () => {
+          const id = 101 + Math.floor(position / 100);
+          rail.innerHTML = `<div id="message-body-${id}"><span id="author-${id}">Author</span><div data-tid="message-body" id="content-${id}">Reply ${id}</div></div>`;
+        };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 100 }, scrollHeight: { get: () => opened ? 300 : 100 },
+          scrollTop: { get: () => position, set: value => { position = Math.max(0, Math.min(200, value)); if (opened) render(); } }
+        });
+        fixture.querySelector("[data-item-type='channel']").addEventListener("click", feed);
+        feed();
+        const collected = [];
+        await loadContent(fixture).loadOlderMessages(collected);
+        assert(collected.map(message => message.id).sort().join() === "100,101,102,103", "Replies below the opened thread's initial position were missed");
+      });
+
+      await test("Queued channel threads are rediscovered after returning to a virtualized feed", async () => {
+        const fixture = parse(folder("other", "other", chat("channel", "Channel", "channel")) + '<main><div id="rail" data-tid="message-pane-body"></div></main>');
+        fixture.title = "Channel";
+        const rail = fixture.getElementById("rail");
+        let position = 0;
+        let opened = [];
+        const post = id => `<div data-tid="channel-pane-message" id="reply-chain-summary-${id}"><div data-tid="message-body" id="content-${id}">Post ${id}</div><div data-tid="response-surface" aria-label="1 reply"><button data-tid="response-summary-button">Open 1 reply</button></div></div>`;
+        const bind = () => rail.querySelectorAll("button").forEach(button => button.addEventListener("click", () => {
+          const id = Number(button.closest("[data-tid='channel-pane-message']").id.replace("reply-chain-summary-", ""));
+          opened.push(id);
+          rail.innerHTML = `<div id="message-body-${id + 1}"><div data-tid="message-body" id="content-${id + 1}">Reply ${id + 1}</div></div>`;
+        }));
+        const render = () => { rail.innerHTML = post(position < 100 ? 100 : 200); bind(); };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 100 }, scrollHeight: { value: 300 },
+          scrollTop: { get: () => position, set: value => { position = Math.max(0, Math.min(200, value)); render(); } }
+        });
+        fixture.querySelector("[data-item-type='channel']").addEventListener("click", () => { position = 0; render(); });
+        rail.innerHTML = post(100) + post(200);
+        bind();
+        const collected = [];
+        await loadContent(fixture).loadOlderMessages(collected);
+        assert(opened.includes(100) && opened.includes(200), "Deferred thread was not reopened");
+        assert(collected.map(message => message.id).sort().join() === "100,101,200,201", "Rediscovered replies were missed");
+      });
+
+      await test("Dedicated channel reply runways include deleted reply tombstones in completeness checks", async () => {
+        const fixture = parse(folder("other", "other", chat("channel", "Channel", "channel")) + '<main></main>');
+        fixture.title = "Channel";
+        const main = fixture.querySelector("main");
+        const feed = () => {
+          main.innerHTML = '<div data-tid="channel-pane-message" id="reply-chain-summary-100"><div data-tid="message-body" id="content-100">Post</div><div data-tid="response-surface" aria-label="2 replies"><button data-tid="response-summary-button">Open 2 replies</button></div></div>';
+          main.querySelector("button").addEventListener("click", () => {
+            main.innerHTML = `<div data-tid="channel-replies-runway">
+              <div data-tid="channel-replies-pane-message"><div id="post-message-renderer-100"><div data-tid="message-body" id="content-100">Post</div></div></div>
+              <div data-tid="channel-replies-pane-message"><div id="message-body-101"><div data-tid="message-body" id="content-101">Normal reply</div></div></div>
+              <div data-tid="channel-replies-pane-message"><div id="message-body-102" data-mid="102"><span data-tid="message-tombstone" id="tombstone-102">This message has been deleted.</span></div></div>
+            </div>`;
+          });
+        };
+        fixture.querySelector("[data-item-type='channel']").addEventListener("click", feed);
+        feed();
+        const collected = [];
+        await loadContent(fixture).loadOlderMessages(collected);
+        assert(collected.map(message => message.id).sort().join() === "100,101,102", "Deleted reply did not count toward the advertised total");
+        const deleted = collected.find(message => message.id === "102");
+        assert(deleted.deleted === true && deleted.threadId === "100" && deleted.text === "This message has been deleted.", "Deleted reply marker or thread ID lost");
+        const existing = [{ id: "102", threadId: "100", text: "Earlier saved reply content", images: [] }];
+        loadContent(fixture).appendUniqueMessages(existing, [deleted]);
+        assert(existing[0].deleted === true, "Repeated reply reads dropped deletion state");
+        assert(main.querySelector("[data-tid='channel-pane-message']"), "Did not return from the dedicated reply runway");
+      });
+
+      await test("Permanently missing queued channel threads reject rather than disappearing from completeness checks", async () => {
+        const fixture = parse(folder("other", "other", chat("channel", "Channel", "channel")) + '<main></main>');
+        fixture.title = "Channel";
+        const main = fixture.querySelector("main");
+        const post = id => `<div data-tid="channel-pane-message" id="reply-chain-summary-${id}"><div data-tid="message-body" id="content-${id}">Post</div><div data-tid="response-surface" aria-label="1 reply"><button data-tid="response-summary-button">Open 1 reply</button></div></div>`;
+        main.innerHTML = post(100) + post(200);
+        main.querySelector("button").addEventListener("click", () => {
+          main.innerHTML = '<div id="message-body-101"><div data-tid="message-body" id="content-101">Reply</div></div>';
+        });
+        fixture.querySelector("[data-item-type='channel']").addEventListener("click", () => { main.innerHTML = post(100); });
+        await rejects(() => loadContent(fixture).loadOlderMessages([]), /could not be rediscovered/);
+      });
+
+      await test("Regular chat extraction still collects messages without a scrolling container", async () => {
+        const fixture = parse('<main><div role="listitem" data-message-id="chat-message"><span data-tid="message-author-name">Chat author</span><time datetime="2026-10-01T12:00:00Z"></time><div data-tid="messageBodyContent">Chat text</div></div></main>');
+        const collected = [];
+        await loadContent(fixture).loadOlderMessages(collected);
+        assert(collected.length === 1 && collected[0].text === "Chat text" && collected[0].author === "Chat author", "Regular chat extraction regressed");
+        assert(!collected[0].threadId, "Regular chat was marked as a channel thread");
+      });
+
+      await test("Channels without a scroll container wait for loading and reject stalled busy panes", async () => {
+        const markup = '<main data-tid="message-pane-body" aria-busy="true"><div role="progressbar"></div><div data-tid="channel-pane-message" id="reply-chain-summary-100"><div data-tid="message-body" id="content-100">Initially loaded post</div></div></main>';
+        const fixture = parse(markup);
+        let ticks = 0;
+        const api = loadContent(fixture, async () => {
+          ticks += 1;
+          if (ticks === 2) {
+            fixture.querySelector("main").setAttribute("aria-busy", "false");
+            fixture.querySelector("[role='progressbar']").remove();
+            fixture.querySelector("main").insertAdjacentHTML("beforeend", '<div data-tid="channel-pane-message" id="reply-chain-summary-200"><div data-tid="message-body" id="content-200">Later loaded post</div></div>');
+          }
+        });
+        const collected = [];
+        await api.loadOlderMessages(collected);
+        assert(ticks >= 2 && collected.map(message => message.id).sort().join() === "100,200", "Busy channel returned an early partial result");
+        await rejects(() => loadContent(parse(markup)).loadOlderMessages([]), /history reached its safety limit/);
+        const rootOnly = parse(markup);
+        rootOnly.querySelector("[role='progressbar']").remove();
+        await rejects(() => loadContent(rootOnly).loadOlderMessages([]), /history reached its safety limit/);
+      });
+
+      await test("Channel transcripts preserve post references and separate different threads", async () => {
+        const api = new Function("chrome", backgroundSource + "\nreturn {groupMessagesForDisplay, buildMessageCardsHtml};")(
+          { runtime: { onMessage: { addListener() {} } } });
+        const messages = [
+          { id: "100", threadId: "100", author: "Author", text: "Post", timestamp: "2026-10-01T12:00:00Z" },
+          { id: "101", threadId: "100", author: "Author", text: "Reply", timestamp: "2026-10-01T12:01:00Z" },
+          { id: "200", threadId: "200", author: "Author", text: "Other post", timestamp: "2026-10-01T12:02:00Z" }
+        ];
+        const groups = api.groupMessagesForDisplay(messages);
+        assert(groups.length >= 2 && groups[groups.length - 1].threadId === "200", "Different threads merged");
+        const html = api.buildMessageCardsHtml(groups);
+        assert(html.includes("Reply to post 100") && html.includes('id="message-100"'), "Thread references omitted");
+      });
+
+      await test("Late channel scrolling containers still trigger scans in both directions", async () => {
+        const fixture = parse('<main><div id="rail" data-tid="message-pane-body" aria-busy="true"><div data-tid="channel-pane-message" id="reply-chain-summary-1002"><div data-tid="message-body" id="content-1002">Initial post</div></div></div></main>');
+        const rail = fixture.getElementById("rail");
+        let position = 200;
+        let ready = false;
+        let ticks = 0;
+        const render = () => {
+          const id = 1000 + Math.floor(position / 100);
+          rail.innerHTML = `<div data-tid="channel-pane-message" id="reply-chain-summary-${id}"><div data-tid="message-body" id="content-${id}">Post ${id}</div></div>`;
+        };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 100 }, scrollHeight: { get: () => ready ? 400 : 0 },
+          scrollTop: { get: () => position, set: value => { position = Math.max(0, Math.min(300, value)); render(); } }
+        });
+        const collected = [];
+        await loadContent(fixture, async () => {
+          ticks += 1;
+          if (ticks === 2) { ready = true; rail.setAttribute("aria-busy", "false"); render(); }
+        }).loadOlderMessages(collected);
+        assert(collected.map(message => message.id).sort().join() === "1000,1001,1002,1003", "Late scrolling container skipped older posts");
       });
 
       await test("Stalled pagination, missing groups, empty selection and expansion failure reject", async () => {
@@ -146,8 +419,17 @@
           archiveCurrentChatToFolder = async (tabId, directory, settings, label) => { archived.push(label || "current"); return {}; };
           rebuildArchiveRootIndex = async () => {};
           validateRootFiles = async () => {};
-          return {loadChatGroupSelection, runArchiveFlow, setBusy};
+          return {loadChatGroupSelection, runArchiveFlow, setBusy, normalizeMessage, dedupeAndSortMessages};
         `)(fixture, testWindow, chromeStub, archived);
+        assert(api.normalizeMessage({ id: "101", threadId: "100" }).threadId === "100", "Archive merge dropped thread IDs");
+        assert(api.normalizeMessage({ id: "102", threadId: "100", deleted: true }).deleted === true, "Archive merge dropped deletion markers");
+        assert(api.dedupeAndSortMessages([{ id: "101", threadId: "100", text: "Reply" }, { id: "101", threadId: "100", text: "Reply" }]).length === 1, "Reply identity deduplication failed");
+        const mergedReply = api.dedupeAndSortMessages([
+          { id: "101", threadId: "100", author: "Unknown", text: "Preview" },
+          { id: "101", threadId: "100", author: "Actual author", timestamp: "2026-10-02T12:00:00Z", text: "Complete reply text" },
+          { id: "101", threadId: "100", author: "Unknown", text: "Preview" }
+        ])[0];
+        assert(mergedReply.text === "Complete reply text" && mergedReply.author === "Actual author" && mergedReply.timestamp === "2026-10-02T12:00:00Z", "Older snapshots overrode fuller channel replies");
         await api.loadChatGroupSelection();
         const start = fixture.getElementById("archive-group-selection-button");
         assert(start.disabled, "Empty selection enabled");
