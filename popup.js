@@ -268,14 +268,19 @@ async function runArchiveFlow({ mode, groupIds = [] }) {
   ensureProgressListener();
   setRunState("running");
   setStatus("Choose an archive folder...");
+  let stage = "selecting the archive folder";
+  let folderSelected = false;
 
   try {
     const rootDirectory = await window.showDirectoryPicker({
       mode: "readwrite"
     });
+    folderSelected = true;
 
+    stage = "saving archive settings";
     const settings = getSettingsFromForm();
     await saveSettings(settings);
+    stage = "connecting to the active Teams tab";
     const activeTab = await getActiveTeamsTab();
 
     if (mode === "groups" && activeTab.id !== groupSelectionTabId) {
@@ -285,9 +290,12 @@ async function runArchiveFlow({ mode, groupIds = [] }) {
     await ensureContentScriptLoaded(activeTab.id);
 
     if (mode === "current") {
+      stage = "collecting and saving the current chat";
       setStatus("Collecting messages from the current Teams chat...");
       const validation = await archiveCurrentChatToFolder(activeTab.id, rootDirectory, settings);
+      stage = "rebuilding the archive index and search files";
       await rebuildArchiveRootIndex(rootDirectory);
+      stage = "verifying the archive index and search files";
       await validateRootFiles(rootDirectory);
       setRunState("finished");
       setStatus(
@@ -296,21 +304,25 @@ async function runArchiveFlow({ mode, groupIds = [] }) {
       return;
     }
 
+    stage = "archiving the requested chats";
     const batchResult = await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings, {
       groupIds: mode === "groups" ? groupIds : null
     });
+    stage = "rebuilding the archive index and search files";
     await rebuildArchiveRootIndex(rootDirectory);
+    stage = "verifying the archive index and search files";
     await validateRootFiles(rootDirectory);
     setRunState("finished");
     setStatus(formatBatchArchiveSummary(batchResult));
   } catch (error) {
-    const wasCancelled = error?.name === "AbortError";
-    setRunState(wasCancelled ? "idle" : "error");
+    const pickerAborted = !folderSelected && error?.name === "AbortError";
+    console.error(`Archive failed while ${stage}.`, error);
+    setRunState(pickerAborted ? "idle" : "error");
     setStatus(
-      wasCancelled
-        ? "Archive cancelled."
-        : error.message || "Unexpected error while archiving chats.",
-      !wasCancelled
+      pickerAborted
+        ? `Folder selection was cancelled or access was denied. Create or select an existing writable archive folder and approve read/write access. Details: ${getErrorDetails(error)}`
+        : `Archive failed while ${stage}: ${getErrorDetails(error)}`,
+      !pickerAborted
     );
   } finally {
     setBusy(false);
@@ -393,7 +405,8 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings, { gro
       archivedCount += 1;
       validatedChats.push(validation);
     } catch (error) {
-      const reason = getErrorMessage(error, "unexpected error while archiving chat");
+      const reason = getErrorDetails(error);
+      console.error(`Archive failed for "${chat.label}".`, error);
       failedChats.push({
         label: chat.label,
         reason
@@ -456,11 +469,20 @@ function getErrorMessage(error, fallbackMessage) {
   return message || fallbackMessage;
 }
 
+function getErrorDetails(error) {
+  const message = getErrorMessage(error, "Unexpected error while archiving chats.");
+  return error?.name && error.name !== "Error" ? `${error.name}: ${message}` : message;
+}
+
 function formatBatchArchiveSummary(result) {
   const failedChats = Array.isArray(result.failedChats) ? result.failedChats : [];
   const lines = [
     `Finished. Archived ${result.archivedCount} chats successfully, skipped ${result.skippedCount}, failed ${failedChats.length}.`
   ];
+
+  if (result.skippedCount > 0) {
+    lines.push("Skipped chats were already archived today. Use Archive Current Chat to capture newer messages today without waiting.");
+  }
 
   if (!failedChats.length) {
     lines.push("Verified the index and search files.");
@@ -1506,14 +1528,22 @@ function parseRelativeTime(timeText, dayOffset) {
 }
 
 async function getOrCreateDirectory(parentHandle, name) {
-  return parentHandle.getDirectoryHandle(name, { create: true });
+  try {
+    return await parentHandle.getDirectoryHandle(name, { create: true });
+  } catch (error) {
+    throw new Error(`Could not create or open folder "${name}": ${getErrorDetails(error)}`, { cause: error });
+  }
 }
 
 async function writeTextFile(directoryHandle, filename, contents) {
-  const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(contents);
-  await writable.close();
+  try {
+    const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(contents);
+    await writable.close();
+  } catch (error) {
+    throw new Error(`Could not write file "${filename}": ${getErrorDetails(error)}`, { cause: error });
+  }
 }
 
 async function materializeInlineImages(chatDirectory, archive) {

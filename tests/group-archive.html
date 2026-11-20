@@ -419,7 +419,9 @@
           archiveCurrentChatToFolder = async (tabId, directory, settings, label) => { archived.push(label || "current"); return {}; };
           rebuildArchiveRootIndex = async () => {};
           validateRootFiles = async () => {};
-          return {loadChatGroupSelection, runArchiveFlow, setBusy, normalizeMessage, dedupeAndSortMessages};
+          return {loadChatGroupSelection, runArchiveFlow, setBusy, normalizeMessage, dedupeAndSortMessages,
+            formatBatchArchiveSummary, getOrCreateDirectory, writeTextFile,
+            failIndex: error => { rebuildArchiveRootIndex = async () => { throw error; }; }};
         `)(fixture, testWindow, chromeStub, archived);
         assert(api.normalizeMessage({ id: "101", threadId: "100" }).threadId === "100", "Archive merge dropped thread IDs");
         assert(api.normalizeMessage({ id: "102", threadId: "100", deleted: true }).deleted === true, "Archive merge dropped deletion markers");
@@ -451,7 +453,28 @@
         assert(messages.length === count && fixture.getElementById("status").textContent.includes("tab changed"), "Tab mismatch not rejected");
         testWindow.showDirectoryPicker = async () => { throw new DOMException("Cancelled", "AbortError"); };
         await api.runArchiveFlow({ mode: "groups", groupIds: ["cat"] });
-        assert(fixture.getElementById("status").textContent === "Archive cancelled." && !start.disabled, "Cancellation recovery failed");
+        let status = fixture.getElementById("status").textContent;
+        assert(status.includes("cancelled or access was denied") && status.includes("AbortError: Cancelled") && !start.disabled, "Cancellation details or recovery failed");
+        assert(fixture.getElementById("run-label").textContent === "Idle", "Picker cancellation was not idle");
+        testWindow.showDirectoryPicker = async () => { throw new DOMException("User activation required", "SecurityError"); };
+        await api.runArchiveFlow({ mode: "current" });
+        status = fixture.getElementById("status").textContent;
+        assert(status.includes("selecting the archive folder") && status.includes("SecurityError: User activation required"), "Picker error details missing");
+        testWindow.showDirectoryPicker = async () => ({});
+        api.failIndex(new DOMException("Write interrupted", "AbortError"));
+        await api.runArchiveFlow({ mode: "current" });
+        status = fixture.getElementById("status").textContent;
+        assert(status.includes("rebuilding the archive index") && status.includes("AbortError: Write interrupted") && !status.includes("cancelled"), "Post-selection failure was treated as cancellation");
+        assert(fixture.getElementById("run-label").textContent === "Stopped with error" && !start.disabled, "Archive failure state or recovery failed");
+        const interrupted = new DOMException("Access revoked", "AbortError");
+        await rejects(() => api.getOrCreateDirectory({ getDirectoryHandle: async () => { throw interrupted; } }, "chat-name"), /folder "chat-name": AbortError: Access revoked/);
+        await rejects(() => api.writeTextFile({
+          getFileHandle: async () => ({ createWritable: async () => ({
+            write: async () => {}, close: async () => { throw interrupted; }
+          }) })
+        }, "latest.json", "{}"), /file "latest.json": AbortError: Access revoked/);
+        const summary = api.formatBatchArchiveSummary({ archivedCount: 0, skippedCount: 2, failedChats: [] });
+        assert(summary.includes("already archived today") && summary.includes("Archive Current Chat"), "Same-day skip guidance missing");
         fixture.getElementById("cancel-group-selection-button").click();
         assert(fixture.getElementById("group-picker").hidden, "Cancel did not close picker");
       });
