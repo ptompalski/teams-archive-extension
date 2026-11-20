@@ -114,6 +114,12 @@ When a channel reply appears first as a preview and later with fuller content, t
 
 While the tool is running, avoid interacting with the Teams tab. You can switch to another tab or another application, but do not click, scroll, change chats, or navigate away in the Teams tab until the status shows that the archive is finished.
 
+### Troubleshooting archive failures
+
+- **Folder selection was cancelled or access was denied:** The browser uses the same error for cancellation, blocked folders, and denied read/write access. Create a dedicated archive subfolder if needed, navigate into it in the picker, select it, and approve access.
+- **Archive failed while ...:** The status identifies the failing stage and includes the original error details. Folder creation and text-file write errors also identify the affected folder or file. The extension popup's developer console retains the original exception for troubleshooting. Files saved before the error may remain; a failed run is not a verified complete archive.
+- **Skipped chats were already archived today:** Batch actions skip chats with an archive from today. This is not a configurable cooldown. **Archive Current Chat** bypasses that check and can capture newer messages immediately.
+
 ## Development checks
 
 Serve the repository root with a local static HTTP server, then open `/tests/group-archive.html` in a browser. The dependency-free regression page tests the actual content, popup, and background scripts against synthetic Teams markup and mocked extension APIs. It covers group boundaries, muted chats, channels, deduplication, expansion, pagination, virtualized rows, channel metadata and thread navigation, bidirectional channel history, error handling, transcript output, and popup routing. It does not access Teams or write archives.
