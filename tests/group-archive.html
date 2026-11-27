@@ -11,6 +11,7 @@
       const popupSource = await (await fetch("../popup.js")).text();
       const backgroundSource = await (await fetch("../background.js")).text();
       const popupMarkup = await (await fetch("../popup.html")).text();
+      const manifest = await (await fetch("../manifest.json")).json();
       const failures = [];
       let passed = 0;
       const assert = (condition, message) => {
@@ -45,6 +46,226 @@
         }
         throw new Error("Expected an error");
       };
+      const popupStorage = {
+        local: {
+          get: async keys => typeof keys === "string"
+            ? { extensionUpdateCheck: { checkedAt: Date.now(), tag: manifest.version, error: "" } }
+            : keys,
+          set: async () => {}
+        }
+      };
+      const popupRuntime = {
+        getManifest: () => manifest,
+        onMessage: { addListener() {} }
+      };
+      const releaseResponse = tag => ({
+        ok: true, json: async () => ({ tag_name: tag, draft: false, prerelease: false })
+      });
+      const loadUpdatePopup = ({
+        installedVersion = "0.1.5", cached, now = Date.now(),
+        fetchRelease = async () => releaseResponse("v0.1.6"), storageError,
+        timeoutMs = 10000
+      } = {}) => {
+        const fixture = parse(popupMarkup);
+        const stored = { extensionUpdateCheck: cached };
+        const requests = [];
+        const errors = [];
+        const api = new Function("document", "window", "chrome", "fetch", "console", "Date", "AbortSignal",
+          popupSource.replace("initializePopup().catch(", "const initialized = initializePopup().catch(") +
+          "\nreturn {initialized, checkForUpdates, setBusy, setRunState, setStatus};"
+        )(fixture, { addEventListener() {} }, {
+          storage: { local: {
+            get: async keys => {
+              if (typeof keys !== "string") return keys;
+              if (storageError) throw storageError;
+              return stored;
+            },
+            set: async values => { Object.assign(stored, values); }
+          } },
+          runtime: { ...popupRuntime, getManifest: () => ({ version: installedVersion }) }
+        }, async (url, options) => {
+          requests.push({ url, options });
+          return fetchRelease(url, options);
+        }, { error: (...args) => errors.push(args) }, { now: () => now },
+        { timeout: () => AbortSignal.timeout(timeoutMs) });
+        return { fixture, stored, requests, errors, api };
+      };
+
+      await test("Update banner compares numeric versions and links to the stable release", async () => {
+        for (const [installedVersion, tag, newer] of [
+          ["0.1.9", "v0.1.10", true],
+          ["0.1.10", "0.1.9", false],
+          ["0.1.5", "v0.1.5.0", false],
+          ["0.1.5", "v0.1.5.1", true],
+          ["0.99.9", "v1.0.0", true]
+        ]) {
+          const popup = loadUpdatePopup({ installedVersion, fetchRelease: async () => releaseResponse(tag) });
+          await popup.api.initialized;
+          assert(popup.fixture.getElementById("update-notice").hidden === !newer, `Wrong update visibility for ${tag}`);
+          if (newer) {
+            assert(popup.fixture.getElementById("update-message").textContent.includes(tag.replace(/^v/, "")),
+              "Available version missing from banner");
+            const link = popup.fixture.getElementById("update-release-link");
+            assert(link.href === `https://github.com/ptompalski/teams-archive-extension/releases/tag/${tag}` &&
+              link.target === "_blank" && link.rel.includes("noopener"), "Release link is incorrect or unsafe");
+          }
+          const request = popup.requests[0];
+          assert(request.url === "https://api.github.com/repos/ptompalski/teams-archive-extension/releases/latest" &&
+            request.options.credentials === "omit" && request.options.signal instanceof AbortSignal,
+            "Release check did not use the public metadata endpoint with a bounded request");
+          assert(!popup.errors.length && popup.fixture.getElementById("run-label").textContent === "Idle",
+            "Update check changed archive state");
+        }
+      });
+
+      await test("Update cache lasts exactly 24 hours and is compared against the currently installed version", async () => {
+        const now = Date.now();
+        const day = 24 * 60 * 60 * 1000;
+        for (const [checkedAt, expectedRequests] of [
+          [now - day + 1, 0], [now - day, 1], [now + 1, 1]
+        ]) {
+          const popup = loadUpdatePopup({ now, cached: { checkedAt, tag: "v0.1.6", error: "" } });
+          await popup.api.initialized;
+          assert(popup.requests.length === expectedRequests, "Cache freshness boundary is incorrect");
+          await popup.api.checkForUpdates();
+          assert(popup.requests.length === expectedRequests, "Repeated opening bypassed daily caching");
+        }
+        const popup = loadUpdatePopup({ now });
+        await popup.api.initialized;
+        assert(popup.stored.extensionUpdateCheck.checkedAt === now, "Release result was not persisted");
+        const reopened = loadUpdatePopup({ now, installedVersion: "0.1.6", cached: popup.stored.extensionUpdateCheck });
+        await reopened.api.initialized;
+        assert(!reopened.requests.length && reopened.fixture.getElementById("update-notice").hidden,
+          "Updating the installed extension retained a stale update banner");
+      });
+
+      await test("Failed and invalid update checks are reported separately and cached without claiming success", async () => {
+        for (const [fetchRelease, expected] of [
+          [async () => { throw new TypeError("Network offline"); }, /Network offline/],
+          [async () => ({ ok: false, status: 403 }), /HTTP 403/],
+          [async () => ({ ok: false, status: 404 }), /No published release.*HTTP 404/],
+          [async () => ({ ok: true, json: async () => { throw new SyntaxError("Invalid JSON"); } }), /Invalid JSON/],
+          [async () => releaseResponse("v1.0.0-beta"), /Unsupported extension version/],
+          [async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.0", prerelease: true }) }), /stable release/]
+        ]) {
+          const popup = loadUpdatePopup({ fetchRelease });
+          await popup.api.initialized;
+          const notice = popup.fixture.getElementById("update-notice");
+          const message = popup.fixture.getElementById("update-message").textContent;
+          assert(!notice.hidden && notice.classList.contains("is-error") && expected.test(message) &&
+            message.includes("Archiving is still available"), "Failure was hidden or shown as an available update");
+          assert(popup.errors.length === 1 && popup.stored.extensionUpdateCheck.error &&
+            popup.fixture.getElementById("run-label").textContent === "Idle" &&
+            !popup.fixture.getElementById("status").textContent, "Update failure changed archiving state or was not logged");
+          const reopened = loadUpdatePopup({ cached: popup.stored.extensionUpdateCheck });
+          await reopened.api.initialized;
+          assert(!reopened.requests.length && expected.test(reopened.fixture.getElementById("update-message").textContent),
+            "Cached failure was hidden or immediately retried");
+          const retry = loadUpdatePopup({
+            now: popup.stored.extensionUpdateCheck.checkedAt + 24 * 60 * 60 * 1000,
+            cached: popup.stored.extensionUpdateCheck
+          });
+          await retry.api.initialized;
+          assert(retry.requests.length === 1 && !retry.fixture.getElementById("update-notice").classList.contains("is-error"),
+            "Expired failure was not retried successfully");
+        }
+        const unavailableStorage = loadUpdatePopup({ storageError: new Error("Storage unavailable") });
+        await unavailableStorage.api.initialized;
+        assert(unavailableStorage.fixture.getElementById("update-message").textContent.includes("Storage unavailable") &&
+          unavailableStorage.fixture.getElementById("run-label").textContent === "Idle",
+          "Storage failure interrupted archiving initialization");
+      });
+
+      await test("Pending and timed-out update checks do not disable controls or overwrite archive progress", async () => {
+        let completeFetch;
+        const popup = loadUpdatePopup({
+          fetchRelease: async () => new Promise(resolve => { completeFetch = resolve; })
+        });
+        for (let tick = 0; tick < 20 && !completeFetch; tick += 1) await Promise.resolve();
+        assert(completeFetch && !popup.fixture.getElementById("archive-chat-button").disabled,
+          "Pending update check disabled archiving");
+        const checkbox = popup.fixture.getElementById("include-images");
+        checkbox.checked = false;
+        checkbox.dispatchEvent(new Event("change"));
+        await Promise.resolve();
+        assert(popup.stored.includeImages === false, "Settings initialization waited for the release request");
+        popup.api.setBusy(true);
+        popup.api.setRunState("running");
+        popup.api.setStatus("Archiving messages...");
+        completeFetch({ ok: false, status: 503 });
+        await popup.api.initialized;
+        assert(popup.fixture.getElementById("status").textContent === "Archiving messages..." &&
+          popup.fixture.getElementById("run-label").textContent === "Running",
+          "Update error overwrote active archive progress");
+        const timedOut = loadUpdatePopup({
+          timeoutMs: 1,
+          fetchRelease: async (url, { signal }) => new Promise((resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          })
+        });
+        await timedOut.api.initialized;
+        assert(timedOut.fixture.getElementById("update-notice").classList.contains("is-error") &&
+          timedOut.stored.extensionUpdateCheck.error && timedOut.errors.length === 1,
+          "Timed-out request did not report and cache the failure");
+      });
+
+      await test("Clicking the installed version bypasses fresh caches and reports both current and newer releases", async () => {
+        for (const currentTag of ["v0.1.4", "v0.1.5"]) {
+          let tag = currentTag;
+          const popup = loadUpdatePopup({
+            cached: { checkedAt: Date.now(), tag: "v0.1.5", error: "" },
+            fetchRelease: async () => releaseResponse(tag)
+          });
+          await popup.api.initialized;
+          const button = popup.fixture.getElementById("extension-version");
+          assert(button.textContent === "v0.1.5" && button.getAttribute("aria-label").includes("Check for updates"),
+            "Installed version is missing or not an accessible check button");
+          button.click();
+          for (let tick = 0; tick < 50 && button.disabled; tick += 1) await Promise.resolve();
+          assert(!button.disabled && popup.requests.length === 1 &&
+            !popup.fixture.getElementById("update-notice").hidden &&
+            popup.fixture.getElementById("update-message").textContent.includes("No newer release is available") &&
+            popup.fixture.getElementById("update-message").textContent.includes(currentTag.slice(1)),
+            "Version click reused the daily cache or did not confirm the latest release");
+          tag = "v0.1.6";
+          button.click();
+          for (let tick = 0; tick < 50 && button.disabled; tick += 1) await Promise.resolve();
+          assert(popup.requests.length === 2 && popup.stored.extensionUpdateCheck.tag === tag &&
+            popup.fixture.getElementById("update-message").textContent.includes("Version 0.1.6 is available") &&
+            popup.fixture.getElementById("update-release-link").href.endsWith("/tag/v0.1.6"),
+            "Repeated manual check did not fetch, cache, or show the new release");
+        }
+      });
+
+      await test("Manual checks retry cached failures, prevent duplicate requests, and preserve active archive progress", async () => {
+        let completeFetch;
+        const popup = loadUpdatePopup({
+          cached: { checkedAt: Date.now(), tag: "", error: "Previously offline" },
+          fetchRelease: async () => new Promise(resolve => { completeFetch = resolve; })
+        });
+        await popup.api.initialized;
+        const button = popup.fixture.getElementById("extension-version");
+        button.click();
+        for (let tick = 0; tick < 20 && !completeFetch; tick += 1) await Promise.resolve();
+        assert(completeFetch && button.disabled && button.getAttribute("aria-busy") === "true" &&
+          popup.fixture.getElementById("update-message").textContent === "Checking for updates..." &&
+          popup.fixture.getElementById("update-release-link").hidden &&
+          !popup.fixture.getElementById("archive-chat-button").disabled,
+          "Manual check did not retry the failed cache or isolate its pending state");
+        button.click();
+        assert(popup.requests.length === 1, "Repeated click started a duplicate request");
+        popup.api.setBusy(true);
+        popup.api.setRunState("running");
+        popup.api.setStatus("Archiving messages...");
+        completeFetch({ ok: false, status: 403 });
+        for (let tick = 0; tick < 50 && button.disabled; tick += 1) await Promise.resolve();
+        assert(!button.disabled && button.getAttribute("aria-busy") === "false" &&
+          !popup.fixture.getElementById("update-release-link").hidden &&
+          popup.fixture.getElementById("update-message").textContent.includes("HTTP 403") &&
+          popup.fixture.getElementById("status").textContent === "Archiving messages..." &&
+          popup.fixture.getElementById("run-label").textContent === "Running",
+          "Manual failure did not restore the version button or overwrote archive progress");
+      });
 
       await test("Group boundaries, muted chats, channels and cross-group deduplication", async () => {
         const fixture = parse(
@@ -323,6 +544,112 @@
         assert(!collected[0].threadId, "Regular chat was marked as a channel thread");
       });
 
+      await test("Post-history progress identifies pending pasted images and the completed snapshot", async () => {
+        const fixture = parse('<title>Progress chat</title><main></main>');
+        const statuses = [];
+        const api = new Function("document", "window", "chrome", contentSource + `
+          let finishImage;
+          loadOlderMessages = async messages => {
+            messages.push({ id: "one", text: "Message", images: [
+              { sourceUrl: "blob:first" }, { sourceUrl: "blob:second" },
+              { sourceUrl: "https://example.com/image.png" }
+            ] });
+          };
+          resolveBlobImageToDataUrl = async source => {
+            if (source === "blob:first") await new Promise(resolve => { finishImage = resolve; });
+            return "data:image/png;base64,AA==";
+          };
+          return {archiveCurrentChat, finishImage: () => finishImage()};
+        `)(fixture, { location: { href: "https://teams.cloud.microsoft/" } }, {
+          runtime: {
+            onMessage: { addListener() {} },
+            sendMessage: message => statuses.push(message.status)
+          }
+        });
+        const archive = api.archiveCurrentChat();
+        for (let tick = 0; tick < 10 && !statuses.some(status => status.includes("Reading pasted image")); tick += 1) await Promise.resolve();
+        assert(statuses[statuses.length - 1].includes("image 1 of 2") &&
+          statuses[statuses.length - 1].includes("1 messages collected"), "Pending image work still showed history completion");
+        api.finishImage();
+        const snapshot = await archive;
+        assert(statuses.some(status => status.includes("image 2 of 2")), "Image progress did not advance");
+        assert(statuses[statuses.length - 1].includes("Snapshot ready: 1 messages and 3 inline image references"),
+          "Snapshot totals or final collection stage missing");
+        assert(snapshot.messages[0].images[1].embeddedDataUrl && snapshot.messages[0].images.length === 3,
+          "Progress changes altered image extraction");
+      });
+
+      await test("Incoming-message scroll resets are retried instead of ending chat history", async () => {
+        const fixture = parse('<main><div id="rail" data-tid="message-pane-body"></div></main>');
+        const rail = fixture.getElementById("rail");
+        let position = 1200;
+        let ticks = 0;
+        const render = () => {
+          const id = `chat-${position / 600}`;
+          rail.innerHTML = `<div role="listitem" data-message-id="${id}"><div data-tid="messageBodyContent">${id}</div></div>`;
+        };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 600 }, scrollHeight: { value: 1800 },
+          scrollTop: { get: () => position, set: value => { position = Math.max(0, Math.min(1200, value)); render(); } }
+        });
+        render();
+        const collected = [];
+        await loadContent(fixture, async () => {
+          ticks += 1;
+          if (ticks === 1) { position = 1200; render(); }
+        }).loadOlderMessages(collected);
+        assert(collected.map(message => message.id).sort().join() === "chat-0,chat-1,chat-2", "Scroll reset caused missing history");
+      });
+
+      await test("Constant-size virtualized chat pages keep loading while new message IDs appear", async () => {
+        const fixture = parse('<main><div id="rail" data-tid="message-pane-body"></div></main>');
+        const rail = fixture.getElementById("rail");
+        let position = 600;
+        let page = 0;
+        const render = () => {
+          rail.innerHTML = `<div role="listitem" data-message-id="page-${page}"><div data-tid="messageBodyContent">Page ${page}</div></div>`;
+        };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 600 }, scrollHeight: { value: 1200 },
+          scrollTop: { get: () => position, set: value => { position = Math.max(0, value); } }
+        });
+        render();
+        const collected = [];
+        await loadContent(fixture, async () => {
+          if (position === 0 && page < 5) { page += 1; render(); }
+        }).loadOlderMessages(collected);
+        assert(collected.length === 6 && collected.some(message => message.id === "page-5"), "Rendered message count was mistaken for complete history");
+      });
+
+      await test("Stalled chat scrolling reports diagnostics instead of saving a partial success", async () => {
+        const fixture = parse('<main><div id="rail" data-tid="message-pane-body"><div role="listitem" data-message-id="last"><div data-tid="messageBodyContent">Recent conversation text</div></div></div></main>');
+        const rail = fixture.getElementById("rail");
+        Object.defineProperties(rail, {
+          clientHeight: { value: 600 }, scrollHeight: { value: 1800 },
+          scrollTop: { get: () => 1200, set() {} }
+        });
+        Object.defineProperty(fixture, "visibilityState", { value: "hidden" });
+        fixture.hasFocus = () => false;
+        await rejects(() => loadContent(fixture).loadOlderMessages([]),
+          /stopped scrolling.*No partial chat snapshot.*1 messages collected; scrollTop=1200.*visibility=hidden; focused=false/);
+      });
+
+      await test("Chat history safety limits reject rather than silently accepting incomplete history", async () => {
+        const fixture = parse('<main><div id="rail" data-tid="message-pane-body"></div></main>');
+        const rail = fixture.getElementById("rail");
+        let page = 0;
+        const render = () => {
+          rail.innerHTML = `<div role="listitem" data-message-id="page-${page}"><div data-tid="messageBodyContent">Page ${page}</div></div>`;
+        };
+        Object.defineProperties(rail, {
+          clientHeight: { value: 600 }, scrollHeight: { value: 1800 },
+          scrollTop: { get: () => 1200, set() {} }
+        });
+        render();
+        await rejects(() => loadContent(fixture, async () => { page += 1; render(); }).loadOlderMessages([]),
+          /Chat history reached its safety limit.*No partial chat snapshot/);
+      });
+
       await test("Channels without a scroll container wait for loading and reject stalled busy panes", async () => {
         const markup = '<main data-tid="message-pane-body" aria-busy="true"><div role="progressbar"></div><div data-tid="channel-pane-message" id="reply-chain-summary-100"><div data-tid="message-body" id="content-100">Initially loaded post</div></div></main>';
         const fixture = parse(markup);
@@ -346,7 +673,7 @@
 
       await test("Channel transcripts preserve post references and separate different threads", async () => {
         const api = new Function("chrome", backgroundSource + "\nreturn {groupMessagesForDisplay, buildMessageCardsHtml};")(
-          { runtime: { onMessage: { addListener() {} } } });
+          { action: { onClicked: { addListener() {} } }, runtime: { onMessage: { addListener() {} } } });
         const messages = [
           { id: "100", threadId: "100", author: "Author", text: "Post", timestamp: "2026-10-01T12:00:00Z" },
           { id: "101", threadId: "100", author: "Author", text: "Reply", timestamp: "2026-10-01T12:01:00Z" },
@@ -390,16 +717,45 @@
         await rejects(() => api.listSelectedGroupChats(["closed"]), /Could not expand/);
       });
 
+      await test("Toolbar opens a persistent bound window and reuses it without retargeting", async () => {
+        assert(!manifest.action.default_popup, "Toolbar still runs the archive in a disposable action popup");
+        const calls = [];
+        let existingTabs = [];
+        const api = new Function("chrome", backgroundSource + "\nreturn {openArchiverWindow};")({
+          action: { onClicked: { addListener() {} } },
+          runtime: {
+            getURL: path => `chrome-extension://test/${path}`,
+            onMessage: { addListener() {} }
+          },
+          tabs: {
+            query: async () => existingTabs,
+            update: async (id, options) => calls.push({ id, options })
+          },
+          windows: {
+            create: async options => calls.push(options),
+            update: async (id, options) => calls.push({ id, options })
+          }
+        });
+        await api.openArchiverWindow({ id: 7 });
+        assert(calls.length === 1 && calls[0].type === "popup" &&
+          calls[0].url.endsWith("popup.html?tabId=7"), "Persistent window was not bound to the original Teams tab");
+        existingTabs = [{ id: 90, windowId: 9 }];
+        await api.openArchiverWindow({ id: 8 });
+        assert(calls.length === 3 && calls[1].id === 90 && calls[2].id === 9 &&
+          calls[2].options.focused, "Existing runner was replaced or not focused");
+      });
+
       await test("Popup selection, batch routing, busy state, cancellation and tab safety", async () => {
         const fixture = parse(popupMarkup);
         const messages = [];
         const archived = [];
         let activeTabId = 7;
         const chromeStub = {
-          storage: { local: { get: async defaults => defaults, set: async () => {} } },
-          runtime: { onMessage: { addListener() {} } },
+          storage: popupStorage,
+          runtime: popupRuntime,
           tabs: {
             query: async () => [{ id: activeTabId, url: "https://teams.cloud.microsoft/" }],
+            get: async id => ({ id, url: "https://teams.cloud.microsoft/" }),
             sendMessage: async (tabId, message) => {
               messages.push(message);
               if (message.type === "LIST_CHAT_GROUPS") return { ok: true, payload: [{ id: "cat", label: "CAT" }, { id: "other", label: "other" }] };
@@ -412,11 +768,19 @@
             }
           }
         };
-        const testWindow = { showDirectoryPicker: async () => ({}) };
+        const testWindow = {
+          showDirectoryPicker: async () => ({}),
+          addEventListener() {}
+        };
         const api = new Function("document", "window", "chrome", "archived", popupSource + `
           wait = async () => {};
           getExistingArchiveSkipReason = async () => "";
-          archiveCurrentChatToFolder = async (tabId, directory, settings, label) => { archived.push(label || "current"); return {}; };
+          archiveCurrentChatToFolder = async (tabId, directory, settings, label) => {
+            if (label) {
+              if (!statusElement.textContent.startsWith("Chat 1 of 1:")) throw new Error("Batch progress lost the chat position");
+            }
+            archived.push(label || "current"); return {};
+          };
           rebuildArchiveRootIndex = async () => {};
           validateRootFiles = async () => {};
           return {loadChatGroupSelection, runArchiveFlow, setBusy, normalizeMessage, dedupeAndSortMessages,
@@ -447,15 +811,15 @@
         await api.runArchiveFlow({ mode: "visible" });
         await api.runArchiveFlow({ mode: "current" });
         assert(archived.join() === "Selected chat,Visible chat,current", "Existing actions regressed");
-        const count = messages.length;
         activeTabId = 8;
         await api.runArchiveFlow({ mode: "groups", groupIds: ["cat"] });
-        assert(messages.length === count && fixture.getElementById("status").textContent.includes("tab changed"), "Tab mismatch not rejected");
+        assert(archived[archived.length - 1] === "Selected chat", "Switching active tabs interrupted a bound archive");
         testWindow.showDirectoryPicker = async () => { throw new DOMException("Cancelled", "AbortError"); };
         await api.runArchiveFlow({ mode: "groups", groupIds: ["cat"] });
         let status = fixture.getElementById("status").textContent;
         assert(status.includes("cancelled or access was denied") && status.includes("AbortError: Cancelled") && !start.disabled, "Cancellation details or recovery failed");
         assert(fixture.getElementById("run-label").textContent === "Idle", "Picker cancellation was not idle");
+        assert(fixture.getElementById("archive-progress-container").hidden, "Cancelled picker retained run progress");
         testWindow.showDirectoryPicker = async () => { throw new DOMException("User activation required", "SecurityError"); };
         await api.runArchiveFlow({ mode: "current" });
         status = fixture.getElementById("status").textContent;
@@ -466,6 +830,10 @@
         status = fixture.getElementById("status").textContent;
         assert(status.includes("rebuilding the archive index") && status.includes("AbortError: Write interrupted") && !status.includes("cancelled"), "Post-selection failure was treated as cancellation");
         assert(fixture.getElementById("run-label").textContent === "Stopped with error" && !start.disabled, "Archive failure state or recovery failed");
+        const progressBar = fixture.getElementById("archive-progress-bar");
+        assert(progressBar.value === 1 && progressBar.max === 2 &&
+          fixture.getElementById("archive-progress-label").textContent.includes("Stopped with error"),
+          "Failed finalization incorrectly completed overall progress");
         const interrupted = new DOMException("Access revoked", "AbortError");
         await rejects(() => api.getOrCreateDirectory({ getDirectoryHandle: async () => { throw interrupted; } }, "chat-name"), /folder "chat-name": AbortError: Access revoked/);
         await rejects(() => api.writeTextFile({
@@ -477,6 +845,297 @@
         assert(summary.includes("already archived today") && summary.includes("Archive Current Chat"), "Same-day skip guidance missing");
         fixture.getElementById("cancel-group-selection-button").click();
         assert(fixture.getElementById("group-picker").hidden, "Cancel did not close picker");
+      });
+
+      await test("Bound runs survive blur, filter progress, warn on close and diagnose disconnected tabs", async () => {
+        const fixture = parse(popupMarkup);
+        const listeners = {};
+        let progressListener;
+        let completeCollection;
+        let disconnect = false;
+        const calls = [];
+        const api = new Function("document", "window", "chrome", popupSource + `
+          rebuildMergedArchive = async snapshot => snapshot;
+          writeArchiveFiles = async () => ({ chatTitle: "Pinned chat" });
+          rebuildArchiveRootIndex = async () => {};
+          validateRootFiles = async () => {};
+          return {runArchiveFlow, archiveCurrentChatToFolder};
+        `)(fixture, {
+          location: { search: "?tabId=7" },
+          addEventListener: (type, listener) => { listeners[type] = listener; },
+          showDirectoryPicker: async () => ({})
+        }, {
+          storage: popupStorage,
+          runtime: {
+            ...popupRuntime,
+            onMessage: { addListener: listener => { progressListener = listener; } },
+            sendMessage: async () => ({ ok: true })
+          },
+          tabs: {
+            get: async id => ({ id, url: "https://teams.cloud.microsoft/" }),
+            query: async () => { throw new Error("Must not follow the active window"); },
+            sendMessage: async (id, message) => {
+              calls.push({ id, message });
+              if (message.type !== "ARCHIVE_CURRENT_CHAT") return { ok: true };
+              if (disconnect) throw new Error("The message port closed before a response was received.");
+              return new Promise(resolve => { completeCollection = resolve; });
+            }
+          }
+        });
+        const run = api.runArchiveFlow({ mode: "current" });
+        for (let tick = 0; tick < 20 && !completeCollection; tick += 1) await Promise.resolve();
+        assert(completeCollection && calls.every(call => call.id === 7), "Archive did not use the pinned Teams tab");
+        const progressBar = fixture.getElementById("archive-progress-bar");
+        assert(progressBar.max === 2 && progressBar.value === 0, "Current-chat progress was not initialized");
+        fixture.dispatchEvent(new Event("blur"));
+        progressListener({ type: "ARCHIVE_PROGRESS", status: "Unrelated chat" }, { tab: { id: 8 } });
+        assert(!fixture.getElementById("status").textContent.includes("Unrelated"), "Unrelated tab overwrote progress");
+        progressListener({ type: "ARCHIVE_PROGRESS", status: "Still collecting" }, { tab: { id: 7 } });
+        assert(fixture.getElementById("status").textContent === "Still collecting", "Bound progress was ignored");
+        let prevented = false;
+        listeners.beforeunload({ preventDefault: () => { prevented = true; } });
+        assert(prevented, "Closing a running window did not request confirmation");
+        completeCollection({ ok: true, payload: { messages: [] } });
+        await run;
+        assert(fixture.getElementById("run-label").textContent === "Finished", "Blur stopped the archive");
+        assert(progressBar.value === progressBar.max, "Verified current-chat run did not complete overall progress");
+        progressListener({ type: "ARCHIVE_PROGRESS", status: "Late progress" }, { tab: { id: 7 } });
+        assert(fixture.getElementById("run-label").textContent === "Finished", "Late progress reset completion");
+        prevented = false;
+        listeners.beforeunload({ preventDefault: () => { prevented = true; } });
+        assert(!prevented, "Idle window still warned on close");
+        disconnect = true;
+        await rejects(() => api.archiveCurrentChatToFolder(7, {}, {}),
+          /Lost connection to the Teams tab.*message port closed/);
+      });
+
+      await test("Open Teams reconnects outside the runner window and invalidates stale group selection", async () => {
+        const fixture = parse(popupMarkup);
+        let teamsTabs = [];
+        const windowCalls = [];
+        const historyCalls = [];
+        let unavailable = false;
+        const api = new Function("document", "window", "chrome", popupSource +
+          "\nreturn {openTeamsWebsite, getActiveTeamsTab, loadChatGroupSelection};")(fixture, {
+          location: { search: "?tabId=7" },
+          addEventListener() {},
+          history: { replaceState: (state, title, url) => historyCalls.push(url) }
+        }, {
+          storage: popupStorage,
+          runtime: popupRuntime,
+          tabs: {
+            query: async () => teamsTabs,
+            get: async id => {
+              if (unavailable) throw new Error("No tab with id");
+              return { id, url: "https://teams.cloud.microsoft/" };
+            },
+            update: async () => {},
+            sendMessage: async (id, message) => message.type === "LIST_CHAT_GROUPS"
+              ? { ok: true, payload: [{ id: "cat", label: "CAT" }] } : { ok: true }
+          },
+          windows: {
+            create: async options => { windowCalls.push(options); return { tabs: [{ id: 8 }] }; },
+            update: async () => {}
+          }
+        });
+        await api.loadChatGroupSelection();
+        assert(!fixture.getElementById("group-picker").hidden, "Group fixture did not load");
+        await api.openTeamsWebsite();
+        assert(windowCalls[0].type === "normal" && (await api.getActiveTeamsTab()).id === 8,
+          "New Teams tab was opened inside the runner or not connected");
+        assert(fixture.getElementById("group-picker").hidden && !fixture.querySelector("#group-list input"),
+          "Reconnecting retained stale group selection");
+        teamsTabs = [{ id: 9, windowId: 3 }, { id: 8, windowId: 2 }];
+        await api.openTeamsWebsite();
+        assert((await api.getActiveTeamsTab()).id === 8 && historyCalls.every(url => url === "?tabId=8"),
+          "Open Teams silently changed a valid connection");
+        unavailable = true;
+        await rejects(() => api.getActiveTeamsTab(), /no longer available.*No tab with id/);
+      });
+
+      await test("Overall progress counts every batch outcome and waits for final verification in all batch modes", async () => {
+        for (const mode of ["visible", "groups"]) {
+          const fixture = parse(popupMarkup);
+          const progressBar = fixture.getElementById("archive-progress-bar");
+          const progressLabel = fixture.getElementById("archive-progress-label");
+          const steps = [];
+          let completeList;
+          let completeIndex;
+          let completeVerification;
+          let cancelled = false;
+          let requestedListType;
+          const hooks = {
+            wait: async () => steps.push({ value: progressBar.value, max: progressBar.max, label: progressLabel.textContent }),
+            skip: async (directory, label) => label === "Skipped" ? "already archived today" : "",
+            archive: async (tabId, directory, settings, label) => {
+              if (label === "Read failure") throw new Error("Could not read history");
+              return { chatTitle: label };
+            },
+            index: async () => new Promise(resolve => { completeIndex = resolve; }),
+            verify: async () => new Promise(resolve => { completeVerification = resolve; })
+          };
+          const api = new Function("document", "window", "chrome", "hooks", popupSource + `
+            wait = hooks.wait;
+            getExistingArchiveSkipReason = hooks.skip;
+            archiveCurrentChatToFolder = hooks.archive;
+            rebuildArchiveRootIndex = hooks.index;
+            validateRootFiles = hooks.verify;
+            groupSelectionTabId = 7;
+            return {runArchiveFlow};
+          `)(fixture, {
+            location: { search: "?tabId=7" },
+            addEventListener() {},
+            showDirectoryPicker: async () => {
+              if (cancelled) throw new DOMException("Cancelled", "AbortError");
+              return {};
+            }
+          }, {
+            storage: popupStorage,
+            runtime: popupRuntime,
+            tabs: {
+              get: async id => ({ id, url: "https://teams.cloud.microsoft/" }),
+              sendMessage: async (id, message) => {
+                if (message.type.startsWith("LIST_")) {
+                  requestedListType = message.type;
+                  return new Promise(resolve => { completeList = resolve; });
+                }
+                if (message.type === "OPEN_CHAT_BY_LABEL" && message.chatLabel === "Open failure") {
+                  return { ok: false, error: "Conversation unavailable" };
+                }
+                return { ok: true };
+              }
+            }
+          }, hooks);
+          const run = api.runArchiveFlow({ mode, groupIds: ["cat"] });
+          for (let tick = 0; tick < 100 && !completeList; tick += 1) await Promise.resolve();
+          assert(completeList && !progressBar.hasAttribute("value"), "Unknown chat total showed determinate progress");
+          assert(requestedListType === (mode === "visible" ? "LIST_VISIBLE_CHATS" : "LIST_SELECTED_GROUP_CHATS"),
+            "Batch progress changed the requested chat scope");
+          completeList({ ok: true, payload: ["Saved", "Skipped", "Open failure", "Read failure"].map(label => ({ label })) });
+          for (let tick = 0; tick < 100 && !completeIndex; tick += 1) await Promise.resolve();
+          assert(completeIndex && steps.map(step => step.value).join() === "1,2,3,4" &&
+            steps.every(step => step.max === 5), "Saved, skipped, or failed chats did not advance overall progress exactly once");
+          assert(progressBar.value === 4 && progressBar.max === 5 &&
+            /80%.*4 of 4 chats processed.*1 saved, 1 skipped, 2 failed.*Finalizing/.test(progressLabel.textContent),
+            "Batch reached 100% before finalization or misreported outcomes");
+          completeIndex();
+          for (let tick = 0; tick < 20 && !completeVerification; tick += 1) await Promise.resolve();
+          assert(completeVerification && progressBar.value < progressBar.max, "Index writing alone completed progress");
+          completeVerification();
+          await run;
+          assert(progressBar.value === progressBar.max && progressLabel.textContent.includes("100%") &&
+            progressLabel.textContent.includes("Finished with failed chats."), "Verified batch did not complete or concealed failed chats");
+          cancelled = true;
+          await api.runArchiveFlow({ mode, groupIds: ["cat"] });
+          assert(fixture.getElementById("archive-progress-container").hidden &&
+            !progressBar.hasAttribute("value"), "A new cancelled run retained the previous 100%");
+        }
+      });
+
+      await test("Saving progress covers merging, images, transcripts, index and verification without stale Teams updates", async () => {
+        const fixture = parse(popupMarkup);
+        const statuses = [];
+        let progressListener;
+        let buildListener;
+        const makeDirectory = name => {
+          const children = new Map();
+          return {
+            name, kind: "directory",
+            values: async function* () { yield* children.values(); },
+            getDirectoryHandle: async (childName, options = {}) => {
+              if (!children.has(childName) && options.create) children.set(childName, makeDirectory(childName));
+              if (!children.has(childName)) throw new DOMException("Missing directory", "NotFoundError");
+              return children.get(childName);
+            },
+            getFileHandle: async (filename, options = {}) => {
+              if (!children.has(filename) && options.create) {
+                let contents = "";
+                children.set(filename, {
+                  name: filename, kind: "file",
+                  getFile: async () => new File([contents], filename),
+                  createWritable: async () => ({
+                    write: async value => {
+                      if (filename === "latest.json" && progressListener) {
+                        const before = fixture.getElementById("status").textContent;
+                        progressListener({ type: "ARCHIVE_PROGRESS", status: "Finished loading older messages." }, { tab: { id: 7 } });
+                        assert(fixture.getElementById("status").textContent === before, "Late Teams progress overwrote the saving stage");
+                      }
+                      contents = value;
+                    },
+                    close: async () => {}
+                  })
+                });
+              }
+              if (!children.has(filename)) throw new DOMException("Missing file", "NotFoundError");
+              return children.get(filename);
+            },
+            removeEntry: async childName => {
+              if (!children.delete(childName)) throw new DOMException("Missing entry", "NotFoundError");
+            }
+          };
+        };
+        const root = makeDirectory("archive");
+        const chatDirectory = await root.getDirectoryHandle("status-chat", { create: true });
+        const snapshots = await chatDirectory.getDirectoryHandle("snapshots", { create: true });
+        const image = { sourceUrl: "data:image/png;base64,AA==" };
+        const snapshot = {
+          chatTitle: "Status chat", exportedAt: "2026-11-27T12:00:00Z",
+          messages: [{ id: "new", author: "Author", timestamp: "2026-11-01T12:00:00Z", text: "New message", images: [image] }]
+        };
+        const oldFile = await snapshots.getFileHandle("old.json", { create: true });
+        const writer = await oldFile.createWritable();
+        await writer.write(JSON.stringify({
+          ...snapshot, exportedAt: "2025-11-27T12:00:00Z",
+          messages: [{ id: "old", author: "Author", timestamp: "2025-11-01T12:00:00Z", text: "Old message", images: [image] }]
+        }));
+        await writer.close();
+        new Function("chrome", backgroundSource)({
+          action: { onClicked: { addListener() {} } },
+          runtime: { onMessage: { addListener: listener => { buildListener = listener; } } }
+        });
+        const api = new Function("document", "window", "chrome", "statuses", popupSource + `
+          const originalSetStatus = setStatus;
+          setStatus = (message, isError = false) => {
+            originalSetStatus(message, isError);
+            statuses.push(statusElement.textContent);
+          };
+          return {runArchiveFlow};
+        `)(fixture, {
+          location: { search: "?tabId=7" },
+          addEventListener() {},
+          showDirectoryPicker: async () => root
+        }, {
+          storage: popupStorage,
+          runtime: {
+            ...popupRuntime,
+            onMessage: { addListener: listener => { progressListener = listener; } },
+            sendMessage: async message => new Promise(resolve => buildListener(message, {}, resolve))
+          },
+          tabs: {
+            get: async id => ({ id, url: "https://teams.cloud.microsoft/" }),
+            sendMessage: async (id, message) => message.type === "ARCHIVE_CURRENT_CHAT"
+              ? { ok: true, payload: snapshot } : { ok: true }
+          }
+        }, statuses);
+        await api.runArchiveFlow({ mode: "current" });
+        for (const stage of [
+          /Merging 2 snapshots.*2 message records/,
+          /Processing pasted image 1 of 2/,
+          /Processing pasted image 2 of 2/,
+          /Writing yearly transcript 2 of 2/,
+          /Verifying yearly transcript 2 of 2/,
+          /Writing index.html \(1 saved chats\)/,
+          /Writing search.html \(2 search entries\)/,
+          /Final verification 2 of 2/
+        ]) assert(statuses.some(status => stage.test(status)), `Missing progress stage: ${stage}`);
+        assert(statuses.filter(status => /Processing pasted image|Writing yearly transcript/.test(status))
+          .every(status => status.startsWith('Chat: "Status chat"\n')), "Chat identity disappeared during saving");
+        assert(!statuses.find(status => status.includes("Writing index.html")).startsWith("Chat:"),
+          "Archive-wide progress retained a stale chat context");
+        assert(fixture.getElementById("run-label").textContent === "Finished", "Archive did not finish verification");
+        const latest = JSON.parse(await (await (await chatDirectory.getFileHandle("latest.json")).getFile()).text());
+        assert(latest.messages.length === 2 && latest.messages.every(message => message.images[0].localPath),
+          "Detailed progress changed merged messages or image output");
       });
 
       window.testResults = { passed, failures };

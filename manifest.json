@@ -12,14 +12,14 @@
   ],
   "host_permissions": [
     "https://teams.microsoft.com/*",
-    "https://teams.cloud.microsoft/*"
+    "https://teams.cloud.microsoft/*",
+    "https://api.github.com/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Teams Chat Archiver",
-    "default_popup": "popup.html"
+    "default_title": "Teams Chat Archiver"
   },
   "content_scripts": [
     {

@@ -8,8 +8,16 @@
 </head>
 <body>
   <main class="popup">
-    <h1>Teams Chat Archiver</h1>
+    <div class="popup-heading">
+      <h1>Teams Chat Archiver</h1>
+      <button id="extension-version" class="version-button" type="button" title="Check for updates" aria-label="Check for updates"></button>
+    </div>
+    <section id="update-notice" class="update-notice" aria-label="Extension updates" aria-live="polite" hidden>
+      <p id="update-message"></p>
+      <a id="update-release-link" href="https://github.com/ptompalski/teams-archive-extension/releases" target="_blank" rel="noopener noreferrer">View release</a>
+    </section>
     <p class="hint">Archive the current Teams web chat into snapshots plus readable HTML pages.</p>
+    <p class="hint">Keep this window open until Finished. It stays connected to the Teams tab it was opened from. You can use other windows, but avoid clicking or scrolling in that Teams tab during archiving.</p>
 
     <div class="actions quick-actions">
       <button id="open-teams-button" class="secondary-button" type="button">Open Teams Website</button>
@@ -38,6 +46,11 @@
     <div id="run-indicator" class="run-indicator is-idle" aria-live="polite">
       <span class="run-dot" aria-hidden="true"></span>
       <span id="run-label">Idle</span>
+    </div>
+    <div id="archive-progress-container" class="archive-progress" hidden>
+      <label id="archive-progress-heading" class="field-label" for="archive-progress-bar">Overall archive progress</label>
+      <progress id="archive-progress-bar" max="1" aria-labelledby="archive-progress-heading" aria-describedby="archive-progress-label"></progress>
+      <p id="archive-progress-label" class="archive-progress-label" aria-live="polite"></p>
     </div>
     <p id="status" class="status" aria-live="polite"></p>
   </main>
