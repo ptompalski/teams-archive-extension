@@ -29,7 +29,7 @@ The browsing webpage uses files stored inside the archive folder. It does not re
 ## Archive selected groups
 
 1. Open the Teams chat list and click the extension icon.
-2. Click **Archive Selected Groups** to load the sidebar groups.
+2. In the archiver window, click **Archive Selected Groups** to load the sidebar groups.
 3. Check one or more groups, such as Favorites, CAT, or other.
 4. Click **Archive Groups** and choose your archive folder.
 
@@ -43,7 +43,7 @@ Channel panes that are still loading are allowed to settle before a non-scrollin
 
 Opened reply threads are scanned in both directions. Deleted replies exposed by Teams are included as stable-ID deletion markers and count toward the advertised reply total; the extension cannot recover deleted content that was never archived. Reply-loading errors include the collected and expected counts to help diagnose unsupported layouts.
 
-If Teams stops loading a group or the safety limit is reached, the selected-group run stops before archiving any chats rather than using a known partial list. Changing the active Teams tab after loading the group picker requires reloading the group list. Existing same-day archive skipping still applies, and the archive folder structure does not change.
+If Teams stops loading a group or the safety limit is reached, the selected-group run stops before archiving any chats rather than using a known partial list. The archiver stays connected to its original Teams tab even when you switch tabs or windows. Reconnecting with **Open Teams Website** to a different Teams tab clears the group selection; reload the group list before continuing. Existing same-day archive skipping still applies, and the archive folder structure does not change.
 
 ## Browse the archive
 
@@ -107,13 +107,46 @@ When a channel reply appears first as a preview and later with fuller content, t
 6. Select the extracted `teams-archive-extension` folder from the repository.
 7. Open Teams on the web at `https://teams.cloud.microsoft/`.
 8. Open a chat and click the extension icon.
-9. Choose whether to include pasted images.
+9. The extension opens a persistent archiver window connected to that Teams tab. Choose whether to include pasted images.
 10. Click **Archive Current Chat**, **Archive All Chats**, or **Archive Selected Groups**. For selected groups, check the groups and click **Archive Groups**.
 11. Choose the root folder where you want the archive stored.
 12. After the tool finishes, which may take a while for larger chats, open that archive folder and open `index.html` to browse the archived chats.
 
-While the tool is running, avoid interacting with the Teams tab. You can switch to another tab or another application, but do not click, scroll, change chats, or navigate away in the Teams tab until the status shows that the archive is finished.
+Keep the archiver window open until the status shows **Finished**. Unlike a toolbar popup, this window does not close when you click elsewhere or switch applications. Clicking the extension icon again brings the existing archiver window forward without changing its connected Teams tab. Closing or reloading the archiver window still interrupts the run; the browser requests confirmation while it is busy.
+
+While the tool is running, avoid interacting with the connected Teams tab. You can switch to another tab or another application, but do not click, scroll, change chats, or navigate away in the Teams tab until the status shows that the archive is finished. Background tabs may load more slowly because of browser throttling; keep Teams visible in its own window if that occurs.
+
+The status follows the entire archive process: history and reply loading, pasted-image extraction, snapshot merging, image processing, transcript writes, archive-wide index/search rebuilding, and final file verification. It includes message, image, snapshot, or transcript counts where available. Batch progress retains the current chat's name and position. History scan counters indicate safety limits, not a completion percentage; the amount of Teams history is not known in advance. Only **Finished** means the full run has completed.
+
+The **Overall archive progress** bar covers the current chat, all visible chats, or all conversations loaded from selected groups. It is indeterminate while the chat list is loading, then counts each saved, skipped, or failed chat as one processed step. Rebuilding and verifying the archive index/search files is one final step, so the bar reaches 100% only after verification. The percentage measures completed steps, not time remaining: larger chats can take much longer than smaller ones. The label reports saved, skipped, and failed counts; 100% can include failed chats and does not mean every chat was archived successfully.
+
+### Troubleshooting archive failures
+
+- **Folder selection was cancelled or access was denied:** The browser uses the same error for cancellation, blocked folders, and denied read/write access. Create a dedicated archive subfolder if needed, navigate into it in the picker, select it, and approve access.
+- **Archive silently stopped after clicking elsewhere (older versions):** Older versions ran in Chrome's toolbar popup, which Chrome destroys on loss of focus. Reload the updated extension in `chrome://extensions` to use the persistent window.
+- **Teams stopped scrolling / history reached its safety limit:** The history scan could not verify the oldest messages. It retries transient scroll resets and tracks collected message identities rather than just counting visible rows. It reports an error instead of saving a known incomplete chat snapshot. Diagnostics include collected message count, scroll position and dimensions, page visibility, and focus state; copy the full status when reporting a problem.
+- **Lost connection to the Teams tab:** Teams was closed, reloaded, navigated away, or possibly discarded by the browser. Keep the Teams tab open and retry. **Open Teams Website** reconnects if the original tab is no longer available.
+- **Archive failed while ...:** The status identifies the failing stage and includes the original error details. Folder creation and text-file write errors also identify the affected folder or file. The archiver window's developer console retains the exception for troubleshooting. Files saved before the error may remain; a failed run is not a verified complete archive.
+- **Skipped chats were already archived today:** Batch actions skip chats with an archive from today. This is not a configurable cooldown. **Archive Current Chat** bypasses that check and can capture newer messages immediately.
+
+## Extension updates
+
+When the archiver window opens, it checks the latest stable [GitHub release](https://github.com/ptompalski/teams-archive-extension/releases) and shows a **View release** banner if its version is newer than the installed extension. Checks are cached locally for 24 hours, including failed attempts, to avoid repeated requests. The check only requests public release metadata from GitHub; no Teams messages or archive data are sent.
+
+The small version number beside the archiver title shows the installed version. Click it to check for updates immediately, bypassing the daily cache. The notice shows **Checking for updates...**, then either a newer release, confirmation that no newer release is available, or an error. Only the version button is disabled while checking; archiving is unaffected.
+
+The update check does not block archiving. If GitHub is unavailable, rate-limited, or has no published release, a separate notice explains that updates could not be checked. Archiving remains available. There are no background checks or automatic installations.
+
+To update an unpacked installation:
+
+1. Wait for any archive run to finish, then close the archiver window.
+2. Follow **View release** and download the release ZIP.
+3. Extract it and replace the extension's files in the same folder originally selected with **Load unpacked**. If using git, pull the released version into that folder instead.
+4. Open `chrome://extensions` and click **Reload** on Teams Chat Archiver.
+5. Refresh your Teams web tab before opening the archiver again.
+
+For maintainers: publish a non-draft, non-prerelease GitHub release with a numeric version tag, such as `v0.1.6` or `0.1.6`, matching `version` in `manifest.json`. Versions can have one to four numeric components, each from 0 to 65535. Merely changing the version on the default branch does not trigger notifications.
 
 ## Development checks
 
-Serve the repository root with a local static HTTP server, then open `/tests/group-archive.html` in a browser. The dependency-free regression page tests the actual content, popup, and background scripts against synthetic Teams markup and mocked extension APIs. It covers group boundaries, muted chats, channels, deduplication, expansion, pagination, virtualized rows, channel metadata and thread navigation, bidirectional channel history, error handling, transcript output, and popup routing. It does not access Teams or write archives.
+Serve the repository root with a local static HTTP server, then open `/tests/group-archive.html` in a browser. The dependency-free regression page tests the actual content, popup, and background scripts against synthetic Teams markup and mocked extension APIs. It covers group boundaries, muted chats, channels, deduplication, expansion, pagination, virtualized rows, channel metadata and thread navigation, bidirectional channel history, error handling, transcript output, persistent-window routing, focus changes, incoming-message scroll resets, incomplete-history diagnostics, detailed progress through saving and verification, and cached and manual update notifications. File-writing tests use in-memory directory handles, and release checks use mocked GitHub responses; the page does not access Teams, contact GitHub, or write archives to disk. Browser APIs are mocked, so live extension-window lifetime and Teams background-loading behavior still require manual validation in Chrome.

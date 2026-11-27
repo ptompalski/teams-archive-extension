@@ -1,3 +1,36 @@
+let archiverWindowOpening = null;
+
+chrome.action.onClicked.addListener((tab) => {
+  if (!archiverWindowOpening) {
+    archiverWindowOpening = openArchiverWindow(tab)
+      .catch((error) => {
+        console.error("Could not open the archiver window.", error);
+      })
+      .finally(() => {
+        archiverWindowOpening = null;
+      });
+  }
+});
+
+async function openArchiverWindow(tab) {
+  const pageUrl = chrome.runtime.getURL("popup.html");
+  const existingTabs = await chrome.tabs.query({ url: `${pageUrl}*` });
+  const existingTab = existingTabs[0];
+
+  if (existingTab) {
+    await chrome.tabs.update(existingTab.id, { active: true });
+    await chrome.windows.update(existingTab.windowId, { focused: true });
+    return;
+  }
+
+  await chrome.windows.create({
+    url: `${pageUrl}?tabId=${tab.id}`,
+    type: "popup",
+    width: 400,
+    height: 720
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type !== "BUILD_ARCHIVE_FILES") {
     return false;

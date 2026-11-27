@@ -63,7 +63,9 @@ async function archiveCurrentChat(chatLabelOverride = "") {
   const chatTitle = normalizeChatTitle(getChatTitle(chatLabelOverride));
   const chatOrder = getCurrentChatListOrder(chatTitle);
   const collectedMessages = [];
+  notifyProgress(`Reading message history for "${chatTitle}"...`);
   await loadOlderMessages(collectedMessages);
+  notifyProgress(`Preparing snapshot from ${collectedMessages.length} collected messages...`);
   const messages = dedupeMessageRecords([
     ...collectedMessages,
     ...collectMessages()
@@ -75,6 +77,9 @@ async function archiveCurrentChat(chatLabelOverride = "") {
       "No messages were found. Open a Teams chat with visible messages and try again."
     );
   }
+
+  const imageCount = messages.reduce((count, message) => count + (message.images || []).length, 0);
+  notifyProgress(`Snapshot ready: ${messages.length} messages and ${imageCount} inline image references. Sending to the archiver window...`);
 
   return {
     exportedAt: new Date().toISOString(),
@@ -383,6 +388,7 @@ async function loadOlderMessages(collectedMessages = []) {
     let stableRounds = 0;
 
     for (let round = 0; round < 200 && !scrollContainer; round += 1) {
+      notifyProgress(`Waiting for Teams to load history: check ${round + 1}/200 (safety limit); ${collectedMessages.length} messages collected...`);
       const previousCount = collectedMessages.length;
       await wait(900);
       await expandChannelMessages(collectedMessages, replyCounts);
@@ -396,7 +402,8 @@ async function loadOlderMessages(collectedMessages = []) {
     }
 
     if (!scrollContainer && stableRounds < 3) {
-      throw new Error("Channel history reached its safety limit. No partial channel snapshot was saved.");
+      throw createHistoryError(isChannel ? "Channel history reached its safety limit." :
+        "Chat history reached its safety limit while waiting for messages to load.", collectedMessages);
     }
   }
 
@@ -408,14 +415,15 @@ async function loadOlderMessages(collectedMessages = []) {
 
   let previousScrollTop = scrollContainer.scrollTop;
   let previousScrollHeight = scrollContainer.scrollHeight;
-  let previousMessageCount = collectMessages().length;
   let stableRounds = 0;
+  let stalledRounds = 0;
   const maxRounds = 80;
 
   for (let round = 0; round < maxRounds; round += 1) {
     scrollContainer = getMessageScrollContainer() || scrollContainer;
-    notifyProgress(`Loading older messages (${round + 1}/${maxRounds})...`);
     appendUniqueMessages(collectedMessages, collectMessages());
+    notifyProgress(`Loading older messages: scan ${round + 1}/${maxRounds} (safety limit); ${collectedMessages.length} messages collected...`);
+    const previousCollectedCount = collectedMessages.length;
 
     if (scrollContainer.scrollTop <= 0) {
       scrollContainer.scrollTop = 0;
@@ -431,48 +439,63 @@ async function loadOlderMessages(collectedMessages = []) {
     await expandChannelMessages(collectedMessages, replyCounts);
     scrollContainer = getMessageScrollContainer() || scrollContainer;
 
-    const currentMessageCount = collectMessages().length;
     const currentScrollTop = scrollContainer.scrollTop;
     const currentScrollHeight = scrollContainer.scrollHeight;
     const noScrollMovement = currentScrollTop === previousScrollTop;
     const noGrowth = currentScrollHeight === previousScrollHeight;
-    const noNewMessages = currentMessageCount === previousMessageCount;
+    const noNewMessages = collectedMessages.length === previousCollectedCount;
 
-    const busy = isChannel && isMessagePaneBusy();
+    const busy = isMessagePaneBusy();
 
-    if (!busy && ((currentScrollTop <= 0 && noNewMessages) || (noScrollMovement && noGrowth && noNewMessages))) {
+    if (!busy && currentScrollTop <= 2 && noGrowth && noNewMessages) {
       stableRounds += 1;
     } else {
       stableRounds = 0;
     }
 
+    stalledRounds = !busy && currentScrollTop > 2 && noScrollMovement && noGrowth && noNewMessages
+      ? stalledRounds + 1 : 0;
+
+    if (stalledRounds >= 3) {
+      throw createHistoryError("Teams stopped scrolling before reaching the oldest messages. An incoming message or interaction may have reset the scroll position.",
+        collectedMessages, scrollContainer);
+    }
+
     previousScrollTop = currentScrollTop;
     previousScrollHeight = currentScrollHeight;
-    previousMessageCount = currentMessageCount;
 
     if (stableRounds >= 3) {
       break;
     }
   }
 
-  if (isChannel) {
-    if (stableRounds < 3) {
-      throw new Error("Channel history reached its safety limit. No partial channel snapshot was saved.");
-    }
+  if (stableRounds < 3) {
+    throw createHistoryError(isChannel ? "Channel history reached its safety limit." :
+      "Chat history reached its safety limit before reaching the oldest messages.", collectedMessages, scrollContainer);
+  }
 
+  if (isChannel) {
     await loadChannelHistoryDown(collectedMessages, replyCounts);
   }
 
   appendUniqueMessages(collectedMessages, collectMessages());
   assertChannelRepliesComplete(collectedMessages, replyCounts);
-  notifyProgress("Finished loading older messages.");
+  notifyProgress(`Message history collected: ${collectedMessages.length} messages. Preparing the snapshot...`);
+}
+
+function createHistoryError(message, collectedMessages, scrollContainer = getMessageScrollContainer()) {
+  const channel = Boolean(getChatRoot().querySelector("[data-tid='channel-pane-message']"));
+  const scrollDetails = scrollContainer
+    ? `scrollTop=${Math.round(scrollContainer.scrollTop)}, scrollHeight=${scrollContainer.scrollHeight}, clientHeight=${scrollContainer.clientHeight}`
+    : "no scrolling container";
+  return new Error(`${message} No partial ${channel ? "channel" : "chat"} snapshot was saved. Diagnostics: ${collectedMessages.length} messages collected; ${scrollDetails}; visibility=${document.visibilityState}; focused=${document.hasFocus()}.`);
 }
 
 async function loadChannelHistoryDown(collectedMessages, replyCounts) {
   let stableRounds = 0;
 
   for (let round = 0; round < 200; round += 1) {
-    notifyProgress(`Reading channel history (${round + 1}/200)...`);
+    notifyProgress(`Reading channel history toward newer posts: scan ${round + 1}/200 (safety limit); ${collectedMessages.length} messages collected...`);
     const previousCount = collectedMessages.length;
     let scrollable = getMessageScrollContainer();
 
@@ -503,7 +526,7 @@ async function loadChannelHistoryDown(collectedMessages, replyCounts) {
     }
   }
 
-  throw new Error("Channel history reached its safety limit. No partial channel snapshot was saved.");
+  throw createHistoryError("Channel history reached its safety limit.", collectedMessages);
 }
 
 function isMessagePaneBusy() {
@@ -523,6 +546,7 @@ async function expandChannelBodies() {
       return;
     }
 
+    notifyProgress("Expanding a truncated channel message...");
     clickElement(control);
 
     for (let attempt = 0; attempt < 20 && control.isConnected &&
@@ -587,8 +611,11 @@ async function expandChannelMessages(collectedMessages, replyCounts) {
       const replies = readReplies();
       appendUniqueMessages(collectedMessages, replies);
 
-      if (new Set(collectedMessages.filter((message) => message.threadId === threadId &&
-          message.id !== threadId).map((message) => message.id)).size >= expected) {
+      const collectedCount = new Set(collectedMessages.filter((message) => message.threadId === threadId &&
+        message.id !== threadId).map((message) => message.id)).size;
+      notifyProgress(`Reading replies for post ${threadId}: ${collectedCount}/${expected} collected; scan ${attempt + 1}/100 (safety limit)...`);
+
+      if (collectedCount >= expected) {
         complete = true;
         break;
       }
@@ -621,6 +648,7 @@ async function expandChannelMessages(collectedMessages, replyCounts) {
     }
 
     if (!thread.isConnected || !getChatRoot().contains(thread)) {
+      notifyProgress(`Returning to the channel feed after reading ${expected} replies...`);
       const entry = findChatListEntry(channelLabel);
 
       if (!entry) {
@@ -1445,14 +1473,13 @@ function collectInlineImages(bodyNode) {
 }
 
 async function enrichMessagesWithEmbeddedImages(messages) {
-  for (const message of messages) {
-    for (const image of message.images || []) {
-      if (image.embeddedDataUrl || !image.sourceUrl || !image.sourceUrl.startsWith("blob:")) {
-        continue;
-      }
+  const pendingImages = messages.flatMap((message) => message.images || [])
+    .filter((image) => !image.embeddedDataUrl && image.sourceUrl?.startsWith("blob:"));
 
-      image.embeddedDataUrl = await resolveBlobImageToDataUrl(image.sourceUrl);
-    }
+  for (let index = 0; index < pendingImages.length; index += 1) {
+    notifyProgress(`Reading pasted image ${index + 1} of ${pendingImages.length} from Teams (${messages.length} messages collected)...`);
+    const image = pendingImages[index];
+    image.embeddedDataUrl = await resolveBlobImageToDataUrl(image.sourceUrl);
   }
 }
 

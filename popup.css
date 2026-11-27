@@ -17,10 +17,58 @@ h1 {
   font-size: 18px;
 }
 
+.popup-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.popup-heading h1 {
+  margin: 0;
+}
+
+.version-button {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 2px 4px;
+  background: transparent;
+  color: #52606d;
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .hint {
   margin: 0 0 16px;
   font-size: 13px;
   line-height: 1.4;
+}
+
+.update-notice {
+  margin-bottom: 16px;
+  padding: 10px;
+  border: 1px solid #b8d4f0;
+  border-radius: 6px;
+  background: #e8f1fb;
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.update-notice p {
+  margin: 0 0 6px;
+}
+
+.update-notice a {
+  color: #005a9c;
+}
+
+.update-notice.is-error {
+  border-color: #f3c4c4;
+  background: #fdecec;
+  color: #b42318;
 }
 
 .field {
@@ -198,4 +246,31 @@ button:disabled {
   font-size: 12px;
   line-height: 1.4;
   white-space: pre-wrap;
+}
+
+.archive-progress {
+  margin-top: 12px;
+}
+
+.archive-progress progress {
+  display: block;
+  width: 100%;
+  height: 12px;
+  margin: 8px 0;
+  accent-color: #005a9c;
+}
+
+.archive-progress-label {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #344054;
+}
+
+.archive-progress.is-error progress {
+  accent-color: #b42318;
+}
+
+.archive-progress.is-error .archive-progress-label {
+  color: #b42318;
 }

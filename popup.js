@@ -10,14 +10,27 @@ const statusElement = document.getElementById("status");
 const includeImagesCheckbox = document.getElementById("include-images");
 const runIndicatorElement = document.getElementById("run-indicator");
 const runLabelElement = document.getElementById("run-label");
+const archiveProgressContainer = document.getElementById("archive-progress-container");
+const archiveProgressBar = document.getElementById("archive-progress-bar");
+const archiveProgressLabel = document.getElementById("archive-progress-label");
+const updateNoticeElement = document.getElementById("update-notice");
+const updateMessageElement = document.getElementById("update-message");
+const updateReleaseLink = document.getElementById("update-release-link");
+const versionButton = document.getElementById("extension-version");
 let progressListenerRegistered = false;
 let groupSelectionTabId = null;
 let isBusy = false;
+let teamsTabId = Number(new URLSearchParams(window.location?.search || "").get("tabId")) || null;
+let contentProgressTabId = null;
+let archiveStatusContext = "";
 const TEAMS_WEB_URL = "https://teams.cloud.microsoft/";
 const TEAMS_URL_PATTERNS = [
   "https://teams.cloud.microsoft/*",
   "https://teams.microsoft.com/*"
 ];
+const RELEASES_URL = "https://github.com/ptompalski/teams-archive-extension/releases";
+const RELEASE_API_URL = "https://api.github.com/repos/ptompalski/teams-archive-extension/releases/latest";
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 initializePopup().catch((error) => {
   setStatus(error.message || "Could not load settings.", true);
@@ -25,8 +38,41 @@ initializePopup().catch((error) => {
 });
 
 function setStatus(message, isError = false) {
-  statusElement.textContent = message;
+  statusElement.textContent = archiveStatusContext ? `${archiveStatusContext}\n${message}` : message;
   statusElement.style.color = isError ? "#b42318" : "#344054";
+}
+
+function showIndeterminateArchiveProgress(message) {
+  archiveProgressContainer.hidden = false;
+  archiveProgressContainer.classList.remove("is-error");
+  archiveProgressBar.max = 1;
+  archiveProgressBar.removeAttribute("value");
+  archiveProgressBar.setAttribute("aria-valuetext", message);
+  archiveProgressLabel.textContent = message;
+}
+
+function updateArchiveProgress({
+  totalChats,
+  archivedCount = 0,
+  skippedCount = 0,
+  failedCount = 0,
+  phase = "chats"
+}) {
+  const processedChats = archivedCount + skippedCount + failedCount;
+  const completedSteps = processedChats + (phase === "finished" ? 1 : 0);
+  const totalSteps = totalChats + 1;
+  const percent = Math.floor(completedSteps * 100 / totalSteps);
+  const phaseLabel = phase === "finished"
+    ? failedCount > 0 ? "Finished with failed chats." : "Finished."
+    : phase === "finalizing" ? "Finalizing the archive index and search files..." : "Archive finalization pending.";
+  const label = `${percent}% - ${processedChats} of ${totalChats} chats processed (${archivedCount} saved, ${skippedCount} skipped, ${failedCount} failed). ${phaseLabel}`;
+
+  archiveProgressContainer.hidden = false;
+  archiveProgressContainer.classList.toggle("is-error", phase === "finished" && failedCount > 0);
+  archiveProgressBar.max = totalSteps;
+  archiveProgressBar.value = completedSteps;
+  archiveProgressBar.setAttribute("aria-valuetext", label);
+  archiveProgressLabel.textContent = label;
 }
 
 function setRunState(state) {
@@ -48,6 +94,18 @@ function setRunState(state) {
 }
 
 async function initializePopup() {
+  const installedVersion = chrome.runtime.getManifest().version;
+  versionButton.textContent = `v${installedVersion}`;
+  versionButton.setAttribute("aria-label", `Version ${installedVersion}. Check for updates.`);
+  versionButton.addEventListener("click", () => runUpdateCheck(true));
+
+  window.addEventListener("beforeunload", (event) => {
+    if (isBusy) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
+
   const settings = await loadSettings();
   includeImagesCheckbox.checked = settings.includeImages;
 
@@ -62,6 +120,120 @@ async function initializePopup() {
       setStatus(error.message || "Could not open the Teams website.", true);
     }
   });
+
+  await runUpdateCheck();
+}
+
+async function runUpdateCheck(force = false) {
+  if (versionButton.disabled) {
+    return;
+  }
+  versionButton.disabled = true;
+  versionButton.setAttribute("aria-busy", "true");
+  if (force) {
+    showUpdateNotice({ checking: true });
+  }
+  try {
+    await checkForUpdates({ force });
+  } catch (error) {
+    console.error("Could not check for extension updates.", error);
+    showUpdateNotice({ error: getErrorMessage(error, "Unexpected update-check error.") });
+  } finally {
+    versionButton.disabled = false;
+    versionButton.setAttribute("aria-busy", "false");
+  }
+}
+
+async function checkForUpdates({ force = false } = {}) {
+  const now = Date.now();
+  let cached;
+  if (!force) {
+    ({ extensionUpdateCheck: cached } = await chrome.storage.local.get("extensionUpdateCheck"));
+  }
+  if (cached && Number.isFinite(cached.checkedAt) && now >= cached.checkedAt &&
+      now - cached.checkedAt < UPDATE_CHECK_INTERVAL_MS &&
+      typeof cached.tag === "string" && typeof cached.error === "string") {
+    showUpdateNotice(cached);
+    return;
+  }
+
+  let result;
+  try {
+    const response = await fetch(RELEASE_API_URL, {
+      headers: { Accept: "application/vnd.github+json" },
+      credentials: "omit",
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) {
+      throw new Error(response.status === 404
+        ? "No published release was found on GitHub (HTTP 404)."
+        : `GitHub returned HTTP ${response.status}.`);
+    }
+    const release = await response.json();
+    if (!release || release.draft || release.prerelease || typeof release.tag_name !== "string") {
+      throw new Error("GitHub did not return a stable release with a version tag.");
+    }
+    compareExtensionVersions(release.tag_name.replace(/^v/i, ""), chrome.runtime.getManifest().version);
+    result = { checkedAt: now, tag: release.tag_name, error: "" };
+  } catch (error) {
+    console.error("Could not check for extension updates.", error);
+    result = { checkedAt: now, tag: "", error: getErrorMessage(error, "Unexpected update-check error.") };
+  }
+
+  await chrome.storage.local.set({ extensionUpdateCheck: result });
+  showUpdateNotice(result, force);
+}
+
+function compareExtensionVersions(left, right) {
+  const parseVersion = (version) => {
+    if (typeof version !== "string" || !/^\d{1,5}(?:\.\d{1,5}){0,3}$/.test(version)) {
+      throw new Error(`Unsupported extension version: ${String(version)}.`);
+    }
+    const parts = version.split(".").map(Number);
+    if (parts.some((part) => part > 65535)) {
+      throw new Error(`Unsupported extension version: ${version}.`);
+    }
+    return parts;
+  };
+  const leftParts = parseVersion(left);
+  const rightParts = parseVersion(right);
+  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
+    const difference = (leftParts[index] || 0) - (rightParts[index] || 0);
+    if (difference) {
+      return difference;
+    }
+  }
+  return 0;
+}
+
+function showUpdateNotice({ tag = "", error = "", checking = false }, showCurrent = false) {
+  updateNoticeElement.hidden = true;
+  updateNoticeElement.classList.toggle("is-error", Boolean(error));
+  updateReleaseLink.href = RELEASES_URL;
+  updateReleaseLink.hidden = checking;
+  updateReleaseLink.textContent = error ? "View releases" : "View release";
+
+  if (checking) {
+    updateMessageElement.textContent = "Checking for updates...";
+  } else if (error) {
+    updateMessageElement.textContent = `Could not check for updates: ${error} Archiving is still available.`;
+  } else {
+    const version = tag.replace(/^v/i, "");
+    const installedVersion = chrome.runtime.getManifest().version;
+    if (compareExtensionVersions(version, installedVersion) <= 0) {
+      if (!showCurrent) {
+        return;
+      }
+      updateMessageElement.textContent = `No newer release is available. Installed: ${installedVersion}; latest release: ${version}.`;
+      updateReleaseLink.textContent = "View releases";
+    } else {
+      updateMessageElement.textContent = `Version ${version} is available (installed: ${installedVersion}).`;
+      updateReleaseLink.href = `${RELEASES_URL}/tag/${encodeURIComponent(tag)}`;
+    }
+  }
+
+  updateNoticeElement.hidden = false;
 }
 
 function getSettingsFromForm() {
@@ -95,12 +267,18 @@ async function saveSettings(settings) {
 }
 
 async function getActiveTeamsTab() {
-  const tabs = await chrome.tabs.query({
-    active: true,
-    currentWindow: true
-  });
+  let activeTab;
 
-  const activeTab = tabs[0];
+  if (teamsTabId) {
+    try {
+      activeTab = await chrome.tabs.get(teamsTabId);
+    } catch (error) {
+      throw new Error(`The connected Teams tab is no longer available. Open Teams Website to reconnect. Details: ${getErrorDetails(error)}`);
+    }
+  } else {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    activeTab = tabs[0];
+  }
 
   if (!activeTab || !activeTab.id || !activeTab.url) {
     throw new Error("No active browser tab found.");
@@ -117,9 +295,10 @@ async function openTeamsWebsite() {
   const teamsTabs = await chrome.tabs.query({
     url: TEAMS_URL_PATTERNS
   });
-  const teamsTab = teamsTabs[0];
+  const teamsTab = teamsTabs.find((tab) => tab.id === teamsTabId) || teamsTabs[0];
 
   if (teamsTab?.id) {
+    connectTeamsTab(teamsTab.id);
     await chrome.tabs.update(teamsTab.id, {
       active: true
     });
@@ -133,9 +312,29 @@ async function openTeamsWebsite() {
     return;
   }
 
-  await chrome.tabs.create({
-    url: TEAMS_WEB_URL
+  const teamsWindow = await chrome.windows.create({
+    url: TEAMS_WEB_URL,
+    type: "normal"
   });
+
+  if (!teamsWindow.tabs?.[0]?.id) {
+    throw new Error("Teams opened, but the browser did not return its tab. Close the archiver window and reopen it from Teams.");
+  }
+
+  connectTeamsTab(teamsWindow.tabs[0].id);
+}
+
+function connectTeamsTab(tabId) {
+  if (teamsTabId !== tabId) {
+    groupSelectionTabId = null;
+    groupListElement.replaceChildren();
+    groupPickerElement.hidden = true;
+    archiveGroupsButton.setAttribute("aria-expanded", "false");
+    updateGroupArchiveButton();
+  }
+
+  teamsTabId = tabId;
+  window.history.replaceState(null, "", `?tabId=${tabId}`);
 }
 
 function isTeamsWebUrl(value) {
@@ -169,14 +368,26 @@ function ensureProgressListener() {
     return;
   }
 
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message?.type === "ARCHIVE_PROGRESS" && message.status) {
+  chrome.runtime.onMessage.addListener((message, sender) => {
+    if (isBusy && sender?.tab?.id === contentProgressTabId &&
+        message?.type === "ARCHIVE_PROGRESS" && message.status) {
       setRunState("running");
       setStatus(message.status);
     }
   });
 
   progressListenerRegistered = true;
+}
+
+async function sendTeamsRequest(tabId, message) {
+  ensureProgressListener();
+  contentProgressTabId = tabId;
+
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } finally {
+    contentProgressTabId = null;
+  }
 }
 
 archiveButton.addEventListener("click", async () => {
@@ -215,6 +426,7 @@ function updateGroupArchiveButton() {
 }
 
 async function loadChatGroupSelection() {
+  archiveProgressContainer.hidden = true;
   setBusy(true);
   setRunState("running");
   setStatus("Reading Teams chat groups...");
@@ -222,7 +434,7 @@ async function loadChatGroupSelection() {
   try {
     const activeTab = await getActiveTeamsTab();
     await ensureContentScriptLoaded(activeTab.id);
-    const response = await chrome.tabs.sendMessage(activeTab.id, { type: "LIST_CHAT_GROUPS" });
+    const response = await sendTeamsRequest(activeTab.id, { type: "LIST_CHAT_GROUPS" });
 
     if (!response?.ok) {
       throw new Error(response?.error || "Could not read Teams chat groups.");
@@ -264,31 +476,50 @@ async function loadChatGroupSelection() {
 }
 
 async function runArchiveFlow({ mode, groupIds = [] }) {
+  archiveStatusContext = "";
   setBusy(true);
   ensureProgressListener();
   setRunState("running");
   setStatus("Choose an archive folder...");
+  showIndeterminateArchiveProgress("Choosing an archive folder...");
+  let stage = "selecting the archive folder";
+  let folderSelected = false;
 
   try {
     const rootDirectory = await window.showDirectoryPicker({
       mode: "readwrite"
     });
+    folderSelected = true;
 
+    stage = "saving archive settings";
+    setStatus("Saving archive settings...");
     const settings = getSettingsFromForm();
     await saveSettings(settings);
+    stage = "connecting to the active Teams tab";
+    setStatus("Connecting to the Teams tab...");
     const activeTab = await getActiveTeamsTab();
 
     if (mode === "groups" && activeTab.id !== groupSelectionTabId) {
       throw new Error("The active Teams tab changed. Reload the group list and try again.");
     }
 
+    teamsTabId = activeTab.id;
     await ensureContentScriptLoaded(activeTab.id);
 
     if (mode === "current") {
+      updateArchiveProgress({ totalChats: 1 });
+      stage = "collecting and saving the current chat";
       setStatus("Collecting messages from the current Teams chat...");
       const validation = await archiveCurrentChatToFolder(activeTab.id, rootDirectory, settings);
+      updateArchiveProgress({ totalChats: 1, archivedCount: 1, phase: "finalizing" });
+      archiveStatusContext = "";
+      stage = "rebuilding the archive index and search files";
+      setStatus("Chat archive saved and verified. Rebuilding the archive-wide index and search files...");
       await rebuildArchiveRootIndex(rootDirectory);
+      stage = "verifying the archive index and search files";
+      setStatus("Performing final verification of the archive index and search files...");
       await validateRootFiles(rootDirectory);
+      updateArchiveProgress({ totalChats: 1, archivedCount: 1, phase: "finished" });
       setRunState("finished");
       setStatus(
         `Finished. Verified ${validation.chatTitle || "chat archive"}, index, and search files.`
@@ -296,23 +527,51 @@ async function runArchiveFlow({ mode, groupIds = [] }) {
       return;
     }
 
+    stage = "archiving the requested chats";
     const batchResult = await archiveVisibleChatsToFolder(activeTab.id, rootDirectory, settings, {
       groupIds: mode === "groups" ? groupIds : null
     });
+    const batchProgress = {
+      totalChats: batchResult.archivedCount + batchResult.skippedCount + batchResult.failedChats.length,
+      archivedCount: batchResult.archivedCount,
+      skippedCount: batchResult.skippedCount,
+      failedCount: batchResult.failedChats.length
+    };
+    updateArchiveProgress({ ...batchProgress, phase: "finalizing" });
+    stage = "rebuilding the archive index and search files";
+    setStatus("Chat collection complete. Rebuilding the archive-wide index and search files...");
     await rebuildArchiveRootIndex(rootDirectory);
+    stage = "verifying the archive index and search files";
+    setStatus("Performing final verification of the archive index and search files...");
     await validateRootFiles(rootDirectory);
+    updateArchiveProgress({ ...batchProgress, phase: "finished" });
     setRunState("finished");
     setStatus(formatBatchArchiveSummary(batchResult));
   } catch (error) {
-    const wasCancelled = error?.name === "AbortError";
-    setRunState(wasCancelled ? "idle" : "error");
+    const pickerAborted = !folderSelected && error?.name === "AbortError";
+    if (pickerAborted) {
+      archiveProgressContainer.hidden = true;
+      archiveProgressBar.removeAttribute("value");
+      archiveProgressLabel.textContent = "";
+    } else {
+      archiveProgressContainer.classList.add("is-error");
+      if (!archiveProgressBar.hasAttribute("value")) {
+        archiveProgressBar.value = 0;
+      }
+      const label = `Stopped with error. ${archiveProgressLabel.textContent}`;
+      archiveProgressLabel.textContent = label;
+      archiveProgressBar.setAttribute("aria-valuetext", label);
+    }
+    console.error(`Archive failed while ${stage}.`, error);
+    setRunState(pickerAborted ? "idle" : "error");
     setStatus(
-      wasCancelled
-        ? "Archive cancelled."
-        : error.message || "Unexpected error while archiving chats.",
-      !wasCancelled
+      pickerAborted
+        ? `Folder selection was cancelled or access was denied. Create or select an existing writable archive folder and approve read/write access. Details: ${getErrorDetails(error)}`
+        : `Archive failed while ${stage}: ${getErrorDetails(error)}`,
+      !pickerAborted
     );
   } finally {
+    archiveStatusContext = "";
     setBusy(false);
   }
 }
@@ -332,9 +591,10 @@ function setBusy(busy) {
 }
 
 async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings, { groupIds = null } = {}) {
+  showIndeterminateArchiveProgress(groupIds === null ? "Reading the visible chat list..." : "Loading all conversations in the selected groups...");
   setStatus(groupIds === null ? "Reading visible Teams chats..." : "Reading selected Teams chat groups...");
 
-  const listResponse = await chrome.tabs.sendMessage(tabId, {
+  const listResponse = await sendTeamsRequest(tabId, {
     type: groupIds === null ? "LIST_VISIBLE_CHATS" : "LIST_SELECTED_GROUP_CHATS",
     ...(groupIds === null ? {} : { groupIds })
   });
@@ -355,21 +615,31 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings, { gro
   let skippedCount = 0;
   const failedChats = [];
   const validatedChats = [];
+  const updateBatchProgress = () => updateArchiveProgress({
+    totalChats: chats.length,
+    archivedCount,
+    skippedCount,
+    failedCount: failedChats.length
+  });
+  updateBatchProgress();
 
   for (let index = 0; index < chats.length; index += 1) {
     const chat = chats[index];
+    archiveStatusContext = `Chat ${index + 1} of ${chats.length}: "${chat.label}"`;
+    setStatus(`Checking for an archive saved today (${archivedCount} saved, ${skippedCount} skipped, ${failedChats.length} failed so far)...`);
     const skipReason = await getExistingArchiveSkipReason(rootDirectory, chat.label);
 
     if (skipReason) {
       skippedCount += 1;
+      updateBatchProgress();
       setStatus(`Skipped "${chat.label}": ${skipReason}`);
       await wait(300);
       continue;
     }
 
-    setStatus(`Opening chat ${index + 1} of ${chats.length}: ${chat.label}`);
+    setStatus("Opening the conversation in Teams...");
 
-    const openResponse = await chrome.tabs.sendMessage(tabId, {
+    const openResponse = await sendTeamsRequest(tabId, {
       type: "OPEN_CHAT_BY_LABEL",
       chatLabel: chat.label,
       chatId: chat.id || "",
@@ -382,30 +652,36 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings, { gro
         label: chat.label,
         reason
       });
+      updateBatchProgress();
       setStatus(`Failed "${chat.label}": ${reason}`, true);
       await wait(1200);
       continue;
     }
 
-    setStatus(`Archiving chat ${index + 1} of ${chats.length}: ${chat.label}`);
+    setStatus("Collecting messages from Teams...");
     try {
       const validation = await archiveCurrentChatToFolder(tabId, rootDirectory, settings, chat.label);
       archivedCount += 1;
       validatedChats.push(validation);
+      updateBatchProgress();
     } catch (error) {
-      const reason = getErrorMessage(error, "unexpected error while archiving chat");
+      const reason = getErrorDetails(error);
+      console.error(`Archive failed for "${chat.label}".`, error);
       failedChats.push({
         label: chat.label,
         reason
       });
+      updateBatchProgress();
       setStatus(`Failed "${chat.label}": ${reason}`, true);
       await wait(1200);
       continue;
     }
 
+    setStatus(`Chat archive saved and verified (${archivedCount} saved, ${skippedCount} skipped, ${failedChats.length} failed so far).${index + 1 < chats.length ? " Preparing the next chat..." : ""}`);
     await wait(900);
   }
 
+  archiveStatusContext = "";
   if (skippedCount > 0) {
     setStatus(`Archived ${archivedCount} chats and skipped ${skippedCount}.`);
     return {
@@ -426,17 +702,28 @@ async function archiveVisibleChatsToFolder(tabId, rootDirectory, settings, { gro
 }
 
 async function archiveCurrentChatToFolder(tabId, rootDirectory, settings, chatLabelOverride = "") {
-  const response = await chrome.tabs.sendMessage(tabId, {
-    type: "ARCHIVE_CURRENT_CHAT",
-    chatLabelOverride
-  });
+  let response;
+
+  try {
+    response = await sendTeamsRequest(tabId, {
+      type: "ARCHIVE_CURRENT_CHAT",
+      chatLabelOverride
+    });
+  } catch (error) {
+    throw new Error(`Lost connection to the Teams tab while collecting messages. The tab may have been closed, reloaded, navigated away, or discarded by the browser. Keep it open and retry. Details: ${getErrorDetails(error)}`);
+  }
 
   if (!response || !response.ok) {
     throw new Error(response?.error || "The Teams page did not return any data.");
   }
 
   const snapshot = response.payload;
+  if (!archiveStatusContext) {
+    archiveStatusContext = `Chat: "${snapshot.chatTitle || chatLabelOverride || "current conversation"}"`;
+  }
+  setStatus(`Received ${snapshot.messages?.length || 0} messages from Teams. Preparing the snapshot...`);
   const mergedArchive = await rebuildMergedArchive(snapshot);
+  setStatus(`Generating archive files for ${mergedArchive.messages.length} snapshot messages...`);
   const buildResponse = await chrome.runtime.sendMessage({
     type: "BUILD_ARCHIVE_FILES",
     snapshot,
@@ -456,11 +743,20 @@ function getErrorMessage(error, fallbackMessage) {
   return message || fallbackMessage;
 }
 
+function getErrorDetails(error) {
+  const message = getErrorMessage(error, "Unexpected error while archiving chats.");
+  return error?.name && error.name !== "Error" ? `${error.name}: ${message}` : message;
+}
+
 function formatBatchArchiveSummary(result) {
   const failedChats = Array.isArray(result.failedChats) ? result.failedChats : [];
   const lines = [
     `Finished. Archived ${result.archivedCount} chats successfully, skipped ${result.skippedCount}, failed ${failedChats.length}.`
   ];
+
+  if (result.skippedCount > 0) {
+    lines.push("Skipped chats were already archived today. Use Archive Current Chat to capture newer messages today without waiting.");
+  }
 
   if (!failedChats.length) {
     lines.push("Verified the index and search files.");
@@ -492,9 +788,11 @@ async function rebuildMergedArchive(snapshot) {
 }
 
 async function writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedArchive, settings) {
+  setStatus("Creating or opening the chat archive folders...");
   const chatDirectory = await getOrCreateDirectory(rootDirectory, buildResponse.folderName);
   const snapshotsDirectory = await getOrCreateDirectory(chatDirectory, "snapshots");
 
+  setStatus(`Writing new snapshot: ${buildResponse.snapshotFilename} (${snapshot.messages.length} messages)...`);
   await writeTextFile(
     snapshotsDirectory,
     buildResponse.snapshotFilename,
@@ -502,6 +800,7 @@ async function writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedA
   );
 
   const mergedFromSnapshots = await rebuildFromSnapshots(snapshotsDirectory, mergedArchive);
+  setStatus(`Generating merged archive files (${mergedFromSnapshots.messages.length} messages)...`);
   const rebuiltResponse = await chrome.runtime.sendMessage({
     type: "BUILD_ARCHIVE_FILES",
     snapshot,
@@ -516,6 +815,7 @@ async function writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedA
   const archiveWithImages = settings.includeImages
     ? await materializeInlineImages(chatDirectory, mergedFromSnapshots)
     : await stripInlineImages(chatDirectory, mergedFromSnapshots);
+  setStatus(`Generating final JSON and readable transcripts (${archiveWithImages.messages.length} messages)...`);
   const finalBuildResponse = await chrome.runtime.sendMessage({
     type: "BUILD_ARCHIVE_FILES",
     snapshot,
@@ -527,13 +827,18 @@ async function writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedA
     throw new Error(finalBuildResponse?.error || "Could not build archive files with images.");
   }
 
+  setStatus(`Writing latest.json (${archiveWithImages.messages.length} merged messages)...`);
   await writeTextFile(chatDirectory, "latest.json", finalBuildResponse.latestJsonText);
+  setStatus("Writing the chat manifest...");
   await writeTextFile(chatDirectory, "manifest.json", finalBuildResponse.manifestText);
 
+  setStatus("Writing the chat overview webpage...");
   await writeTextFile(chatDirectory, "latest.html", finalBuildResponse.latestHtmlText);
   await syncYearlyHtmlFiles(chatDirectory, finalBuildResponse.yearlyHtmlFiles || []);
+  setStatus("Cleaning up legacy transcript files...");
   await deleteDirectoryContentsIfExists(chatDirectory, "md");
 
+  setStatus("Verifying the saved chat snapshot and transcripts...");
   await validateChatArchiveFiles(
     chatDirectory,
     buildResponse.snapshotFilename,
@@ -547,28 +852,34 @@ async function writeArchiveFiles(rootDirectory, buildResponse, snapshot, mergedA
 }
 
 async function validateChatArchiveFiles(chatDirectory, snapshotFilename, yearlyHtmlFiles) {
-  await validateTextFile(chatDirectory, "latest.json");
-  await validateTextFile(chatDirectory, "manifest.json");
-  await validateTextFile(chatDirectory, "latest.html");
+  for (const filename of ["latest.json", "manifest.json", "latest.html"]) {
+    setStatus(`Verifying saved chat file: ${filename}...`);
+    await validateTextFile(chatDirectory, filename);
+  }
 
+  setStatus(`Verifying saved snapshot: ${snapshotFilename}...`);
   const snapshotsDirectory = await chatDirectory.getDirectoryHandle("snapshots");
   await validateTextFile(snapshotsDirectory, snapshotFilename);
 
   if (Array.isArray(yearlyHtmlFiles) && yearlyHtmlFiles.length) {
     const htmlDirectory = await chatDirectory.getDirectoryHandle("html");
 
-    for (const file of yearlyHtmlFiles) {
+    for (let index = 0; index < yearlyHtmlFiles.length; index += 1) {
+      const file = yearlyHtmlFiles[index];
       if (!file?.filename) {
         continue;
       }
 
+      setStatus(`Verifying yearly transcript ${index + 1} of ${yearlyHtmlFiles.length}: ${file.filename}...`);
       await validateTextFile(htmlDirectory, file.filename);
     }
   }
 }
 
 async function validateRootFiles(rootDirectory) {
+  setStatus("Final verification 1 of 2: archive index (index.html)...");
   await validateTextFile(rootDirectory, "index.html");
+  setStatus("Final verification 2 of 2: search page (search.html)...");
   await validateTextFile(rootDirectory, "search.html");
 }
 
@@ -584,6 +895,7 @@ async function validateTextFile(directoryHandle, filename) {
 }
 
 async function rebuildArchiveRootIndex(rootDirectory) {
+  setStatus("Reading saved conversations to rebuild the archive-wide index and search...");
   const entries = [];
   const searchRecords = [];
 
@@ -592,6 +904,7 @@ async function rebuildArchiveRootIndex(rootDirectory) {
       continue;
     }
 
+    setStatus(`Reading archive folder "${entry.name}" (${entries.length} chats indexed so far)...`);
     const manifest = await readJsonFileIfExists(entry, "manifest.json");
 
     if (!manifest) {
@@ -620,6 +933,7 @@ async function rebuildArchiveRootIndex(rootDirectory) {
     });
 
     if (latestArchive?.messages?.length) {
+      setStatus(`Building search entries for "${manifest.chatTitle || entry.name}": ${latestArchive.messages.length} messages (${entries.length} chats indexed)...`);
       searchRecords.push(
         ...buildSearchRecords({
           folderName: entry.name,
@@ -654,8 +968,14 @@ async function rebuildArchiveRootIndex(rootDirectory) {
     return left.chatTitle.localeCompare(right.chatTitle);
   });
 
-  await writeTextFile(rootDirectory, "index.html", buildArchiveRootIndexHtml(entries));
-  await writeTextFile(rootDirectory, "search.html", buildArchiveSearchHtml(searchRecords));
+  setStatus(`Generating the archive index for ${entries.length} saved chats...`);
+  const indexHtml = buildArchiveRootIndexHtml(entries);
+  setStatus(`Writing index.html (${entries.length} saved chats)...`);
+  await writeTextFile(rootDirectory, "index.html", indexHtml);
+  setStatus(`Generating the search page with ${searchRecords.length} search entries...`);
+  const searchHtml = buildArchiveSearchHtml(searchRecords);
+  setStatus(`Writing search.html (${searchRecords.length} search entries)...`);
+  await writeTextFile(rootDirectory, "search.html", searchHtml);
 }
 
 async function readJsonFileIfExists(directoryHandle, filename) {
@@ -1273,32 +1593,41 @@ function looksLikePersonDisplayName(value) {
 }
 
 async function syncYearlyHtmlFiles(chatDirectory, yearlyHtmlFiles) {
+  setStatus(`Preparing ${yearlyHtmlFiles.length} yearly transcript files...`);
   const htmlDirectory = await getOrCreateDirectory(chatDirectory, "html");
   const wanted = new Set(yearlyHtmlFiles.map((file) => file.filename));
 
-  for (const file of yearlyHtmlFiles) {
+  for (let index = 0; index < yearlyHtmlFiles.length; index += 1) {
+    const file = yearlyHtmlFiles[index];
+    setStatus(`Writing yearly transcript ${index + 1} of ${yearlyHtmlFiles.length}: ${file.filename}...`);
     await writeTextFile(htmlDirectory, file.filename, file.content);
   }
 
+  setStatus("Checking for obsolete yearly transcript files...");
   for await (const entry of htmlDirectory.values()) {
     if (entry.kind !== "file") {
       continue;
     }
 
     if (!wanted.has(entry.name)) {
+      setStatus(`Removing obsolete yearly transcript: ${entry.name}...`);
       await htmlDirectory.removeEntry(entry.name);
     }
   }
 }
 
 async function rebuildFromSnapshots(snapshotsDirectory, fallbackArchive) {
+  setStatus("Reading saved snapshots to merge conversation history...");
   const snapshots = [];
+  let filesRead = 0;
 
   for await (const entry of snapshotsDirectory.values()) {
     if (entry.kind !== "file" || !entry.name.endsWith(".json")) {
       continue;
     }
 
+    filesRead += 1;
+    setStatus(`Reading saved snapshot ${filesRead}: ${entry.name}...`);
     const file = await entry.getFile();
     const text = await file.text();
 
@@ -1319,9 +1648,9 @@ async function rebuildFromSnapshots(snapshotsDirectory, fallbackArchive) {
     return leftTime - rightTime;
   });
 
-  const mergedMessages = dedupeAndSortMessages(
-    snapshots.flatMap((snapshot) => snapshot.messages || [])
-  );
+  const snapshotMessages = snapshots.flatMap((snapshot) => snapshot.messages || []);
+  setStatus(`Merging ${snapshots.length} snapshots: deduplicating and sorting ${snapshotMessages.length} message records...`);
+  const mergedMessages = dedupeAndSortMessages(snapshotMessages);
   const lastSnapshot = snapshots[snapshots.length - 1];
 
   return {
@@ -1506,21 +1835,32 @@ function parseRelativeTime(timeText, dayOffset) {
 }
 
 async function getOrCreateDirectory(parentHandle, name) {
-  return parentHandle.getDirectoryHandle(name, { create: true });
+  try {
+    return await parentHandle.getDirectoryHandle(name, { create: true });
+  } catch (error) {
+    throw new Error(`Could not create or open folder "${name}": ${getErrorDetails(error)}`, { cause: error });
+  }
 }
 
 async function writeTextFile(directoryHandle, filename, contents) {
-  const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(contents);
-  await writable.close();
+  try {
+    const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(contents);
+    await writable.close();
+  } catch (error) {
+    throw new Error(`Could not write file "${filename}": ${getErrorDetails(error)}`, { cause: error });
+  }
 }
 
 async function materializeInlineImages(chatDirectory, archive) {
+  const totalImages = (archive.messages || []).reduce((count, message) => count + (message.images || []).length, 0);
+  setStatus(`Preparing image assets: ${totalImages} inline image references to process...`);
   const imagesDirectory = await getOrCreateDirectory(chatDirectory, "assets");
   const nestedImagesDirectory = await getOrCreateDirectory(imagesDirectory, "images");
   const wantedPaths = new Set();
   const updatedMessages = [];
+  let processedImages = 0;
 
   for (let messageIndex = 0; messageIndex < (archive.messages || []).length; messageIndex += 1) {
     const message = archive.messages[messageIndex];
@@ -1528,6 +1868,8 @@ async function materializeInlineImages(chatDirectory, archive) {
 
     for (let imageIndex = 0; imageIndex < (message.images || []).length; imageIndex += 1) {
       const image = message.images[imageIndex];
+      processedImages += 1;
+      setStatus(`Processing pasted image ${processedImages} of ${totalImages} (message ${messageIndex + 1} of ${archive.messages.length}): fetching and writing image data...`);
       const savedImage = await saveInlineImage(
         nestedImagesDirectory,
         message,
@@ -1549,6 +1891,7 @@ async function materializeInlineImages(chatDirectory, archive) {
     });
   }
 
+  setStatus(`Cleaning unused image assets (${wantedPaths.size} referenced image paths)...`);
   await pruneUnusedImageAssets(nestedImagesDirectory, wantedPaths);
 
   return {
@@ -1559,6 +1902,7 @@ async function materializeInlineImages(chatDirectory, archive) {
 }
 
 async function stripInlineImages(chatDirectory, archive) {
+  setStatus("Images are disabled. Removing image references and cleaning saved image assets...");
   const imagesDirectory = await getOrCreateDirectory(chatDirectory, "assets");
   const nestedImagesDirectory = await getOrCreateDirectory(imagesDirectory, "images");
   await pruneUnusedImageAssets(nestedImagesDirectory, new Set());
